@@ -3,8 +3,10 @@ AOTE 管控系统 - 日志模块
 支持按日期轮转、加密存储，记录所有关键事件
 """
 import os
+import time
 import logging
 import hashlib
+import threading
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,16 +15,26 @@ from pathlib import Path
 class AOTELogger:
     _instance = None
     _initialized = False
+    _singleton_lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
+        # 双重检查锁定：线程安全的单例创建
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            with cls._singleton_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self, log_path: str = None, retention_days: int = 30):
         if self._initialized:
             return
-        self._initialized = True
+        with self._singleton_lock:
+            if self._initialized:
+                return
+            self._initialized = True
+
+        # 日志写入锁：多线程 flush 避免日志交叉错乱
+        self._write_lock = threading.Lock()
 
         if log_path is None:
             log_path = r"C:\ProgramData\ClassroomGuard\logs"

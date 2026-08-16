@@ -239,6 +239,8 @@ class GuardianApp:
     def _on_authorized_usb(self) -> Optional[str]:
         """U盘认证成功 -> 弹出模式选择窗口 -> 执行对应解锁"""
         selector = USBModeSelector(self.config, self.logger, self.process_hunter)
+        # 注入与AntiTamper一致的密码校验器（Major 6: 维护模式密码一致性）
+        selector._verify_admin_callback = self.anti_tamper.verify_admin_password
         mode = selector.show_and_wait()
         if not mode:
             return None

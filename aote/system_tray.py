@@ -34,25 +34,40 @@ class SystemTray:
 
     # ============ 图标生成 ============
     def _generate_icon_image(self):
-        """生成托盘图标（使用PIL，避免外部图片）"""
+        """生成托盘图标（使用PIL，避免外部图片）
+        Minor 12 修复：
+        - 捕获 PIL/ImageDraw/text 不存在或 Pillow 版本过低（font_size 参数无效）的所有异常
+        - 即使所有绘制步骤失败，最后 fallback 一定返回纯色图或 None，绝不崩溃
+        """
         try:
             from PIL import Image, ImageDraw
+        except Exception as e:
+            self.logger.debug(f"PIL 不可用，跳过图标: {e}")
+            return None
+        try:
             # 一个蓝色盾牌 + 白色字母A
             img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
-            # 背景圆
-            draw.ellipse((4, 4, 60, 60), fill=(0, 120, 215, 255), outline=(0, 80, 160, 255), width=3)
-            # 字母A
-            draw.text((18, 8), "A", fill=(255, 255, 255, 255),
-                      font_size=40)
+            # 背景圆（某些老版 Pillow outline 的 width 参数可能不支持）
+            try:
+                draw.ellipse((4, 4, 60, 60), fill=(0, 120, 215, 255), outline=(0, 80, 160, 255), width=3)
+            except Exception:
+                draw.ellipse((4, 4, 60, 60), fill=(0, 120, 215, 255), outline=(0, 80, 160, 255))
+            # 字母A：老版 Pillow 可能不支持 font_size= 关键字参数，降级为默认字体
+            try:
+                draw.text((18, 8), "A", fill=(255, 255, 255, 255), font_size=40)
+            except Exception:
+                draw.text((22, 12), "A", fill=(255, 255, 255, 255))
             # 盾牌角标
-            draw.rectangle((2, 2, 14, 14), fill=(0, 180, 0, 255))
+            try:
+                draw.rectangle((2, 2, 14, 14), fill=(0, 180, 0, 255))
+            except Exception:
+                pass
             return img
         except Exception as e:
             self.logger.debug(f"生成图标失败: {e}")
             # Fallback: 简单图像
             try:
-                from PIL import Image
                 return Image.new("RGB", (64, 64), (0, 120, 215))
             except Exception:
                 return None
@@ -127,8 +142,8 @@ class SystemTray:
             return
 
         def _checked(prefix):
-            """返回带状态前缀的菜单文本"""
-            return lambda item: f"{prefix} {_get_status()}"
+            """返回带状态前缀的菜单文本（pystray 菜单文本函数签名必须是 (icon, item)）"""
+            return lambda icon, item: f"{prefix} {_get_status()}"
 
         def _get_status():
             mode_short = {
@@ -142,7 +157,7 @@ class SystemTray:
 
         # 构建菜单
         menu = Menu(
-            Item(lambda icon: f"📊 系统状态 {_get_status()}", self._menu_status),
+            Item(lambda icon, item: f"📊 系统状态 {_get_status()}", self._menu_status),
             Menu.SEPARATOR,
             Item("🔒 切回严格模式", self._menu_strict_mode),
             Item("🔓 切到宽松模式(调试)", self._menu_relaxed_mode),

@@ -41,11 +41,18 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
         """确保只接受本地连接"""
         try:
             client_ip = self.client_address[0]
-            if client_ip not in ("127.0.0.1", "::1", "localhost"):
+            # 注意：TCP socket 的 client_address[0] 一定是 IP 字符串，永远不会是 "localhost"（DNS层概念），
+            # 所以只检查 127.0.0.1 / ::1 即可。
+            if client_ip not in ("127.0.0.1", "::1"):
                 self._send_json(403, {"error": "local_only"})
                 return False
         except Exception:
-            pass
+            # 拿不到客户端地址时保守起见：拒绝
+            try:
+                self._send_json(403, {"error": "local_only"})
+            except Exception:
+                pass
+            return False
         return True
 
     def do_GET(self):
@@ -92,23 +99,27 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
                         f"[扩展拦截] 违禁内容: {url} 原因: {reason} (level={level})"
                     )
 
-                # 触发所有目标进程冻结（包括浏览器）
-                killed_pids = []
+                frozen_pids = []
                 if self.server_process_hunter:
-                    # 确保立刻扫描并冻结所有浏览器
-                    import psutil
-                    browsers = self.server_config.get("target_processes.browsers", [])
-                    browsers = {b.lower() for b in browsers}
-                    for p in psutil.process_iter(["pid", "name"]):
-                        try:
-                            if p.name().lower() in browsers:
-                                # 直接调用冻结
-                                self.server_process_hunter._freeze_process(p)
-                                killed_pids.append(p.pid)
-                        except Exception:
-                            pass
+                    # 检查是否允许冻结（解锁时不冻结）
+                    if not self.server_process_hunter.is_unlocked:
+                        # 只冻结浏览器（遵循正常冻结流程：进程树遍历+已冻结检查）
+                        import psutil
+                        browsers = self.server_config.get("target_processes.browsers", [])
+                        browsers_set = {b.lower() for b in browsers}
+                        for p in psutil.process_iter(["pid", "name"]):
+                            try:
+                                if p.name().lower() in browsers_set:
+                                    # 使用公有冻结流程：进程树展开
+                                    proctree = self.server_process_hunter._get_process_tree(p)
+                                    for tp in proctree:
+                                        # _freeze_process 内部有已冻结检查，可安全调用
+                                        self.server_process_hunter._freeze_process(tp)
+                                        frozen_pids.append(tp.pid)
+                            except Exception:
+                                pass
 
-                self._send_json(200, {"status": "ok", "killed": killed_pids})
+                self._send_json(200, {"status": "ok", "frozen": frozen_pids})
             except Exception as e:
                 if self.server_logger:
                     self.server_logger.error(f"[HTTP] /kill 异常: {e}")

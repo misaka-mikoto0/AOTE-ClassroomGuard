@@ -51,6 +51,7 @@ class AntiTamper:
         # 本进程标识
         self._is_watchdog = False  # 是否为守护进程（主/副区分）
         self._partner_pid: Optional[int] = None
+        self._respawn_pending = False  # 是否已安排复活Timer，防止重复安排
 
     # ============ 外部接口 ============
     def set_on_emergency_exit(self, cb: Callable[[], None]):
@@ -64,6 +65,7 @@ class AntiTamper:
     def set_partner_pid(self, pid: Optional[int]):
         """设置对端进程ID（双进程守护）"""
         self._partner_pid = pid
+        self._respawn_pending = False  # 设置了新partner时清除pending状态
 
     def mark_as_watchdog(self, is_watchdog: bool):
         self._is_watchdog = is_watchdog
@@ -73,14 +75,29 @@ class AntiTamper:
         self._last_extension_heartbeat = time.time()
 
     def verify_admin_password(self, password: str) -> bool:
-        """校验管理员密码（回文验证：正确密码作为用户输入的子字符串即通过）"""
+        """校验管理员密码
+        回文验证：正确密码必须完整出现在用户输入的任意位置（作为连续子串）
+        但限制子串长度 ≥ 8 位，防止暴力枚举短子串的安全放大效应，同时保持便利性
+        """
         expected = self.config.get("emergency.admin_password_hash", "").lower()
         if not expected:
             return False
         n = len(password)
+        # 只检查长度 ≥ 8 的子串（正确密码通常为8位以上）
+        # 同时从完整输入精确匹配开始，快速路径优先
+        if sha256_str(password).lower() == expected:
+            self.logger.log_admin_action("password_verify", True)
+            return True
+        # 再检查子串（长度 8~n）
+        MIN_SUBSTR_LEN = 8
         for i in range(n):
-            for j in range(i + 1, n + 1):
-                if sha256_str(password[i:j]).lower() == expected:
+            # 剩余长度不足 MIN_SUBSTR_LEN 就不再枚举
+            max_j = min(n, i + max(n, 100))
+            for j in range(max(i + MIN_SUBSTR_LEN, i + 1), max_j + 1):
+                substr = password[i:j]
+                if len(substr) < MIN_SUBSTR_LEN:
+                    continue
+                if sha256_str(substr).lower() == expected:
                     self.logger.log_admin_action("password_verify", True)
                     return True
         self.logger.log_admin_action("password_verify", False)
@@ -240,7 +257,7 @@ class AntiTamper:
 
     def _check_partner_alive(self):
         """检查对端进程是否存活"""
-        if not self._partner_pid:
+        if not self._partner_pid or self._respawn_pending:
             return
         try:
             import psutil
@@ -251,10 +268,13 @@ class AntiTamper:
             if not proc.is_running():
                 raise Exception("not running")
         except Exception:
-            # 对端进程已死
+            # 对端进程已死：先清空partner_pid并标记pending，防止下次循环重复安排
+            dead_pid = self._partner_pid
+            self._partner_pid = None
+            self._respawn_pending = True
             self.logger.log_anti_tamper(
                 "partner_killed",
-                f"对端进程 {self._partner_pid} 已死亡，准备复活"
+                f"对端进程 {dead_pid} 已死亡，准备复活"
             )
             # 重启延迟
             delay = int(self.config.get("watchdog.restart_delay", 1))
@@ -286,6 +306,7 @@ class AntiTamper:
                 close_fds=True
             )
             self._partner_pid = proc.pid
+            self._respawn_pending = False
             self.logger.log_anti_tamper(
                 "partner_respawned",
                 f"已复活对端进程，新PID={proc.pid}"
@@ -296,6 +317,7 @@ class AntiTamper:
                 except Exception:
                     pass
         except Exception as e:
+            self._respawn_pending = False
             self.logger.error(f"复活对端进程失败: {e}")
 
     # ============ 紧急退出验证 ============
@@ -413,10 +435,26 @@ class AntiTamper:
             custom_entry = ttk.Entry(custom_frame, font=("Consolas", 12), width=8, justify=tk.CENTER)
             custom_entry.pack(side=tk.LEFT, padx=8)
 
+            # 自定义解锁时间上限（防止超长解锁）
+            MAX_CUSTOM_MINUTES = 180  # 3 小时
+
             def _custom_ok():
                 val = custom_entry.get().strip()
-                if val.isdigit() and int(val) > 0:
-                    _choose_unlock(int(val) * 60)
+                if not val.isdigit():
+                    messagebox.showwarning("输入无效", "请输入正整数分钟数", parent=dlg2)
+                    return
+                minutes = int(val)
+                if minutes <= 0:
+                    messagebox.showwarning("输入无效", "解锁时长必须大于 0 分钟", parent=dlg2)
+                    return
+                if minutes > MAX_CUSTOM_MINUTES:
+                    messagebox.showwarning(
+                        "超过上限",
+                        f"自定义解锁时长不能超过 {MAX_CUSTOM_MINUTES} 分钟（3 小时）",
+                        parent=dlg2
+                    )
+                    return
+                _choose_unlock(minutes * 60)
 
             tk.Button(
                 custom_frame, text="确认",

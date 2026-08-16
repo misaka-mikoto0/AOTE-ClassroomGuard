@@ -198,6 +198,21 @@ class ProcessHunter:
                 continue
         return found
 
+    def _find_extra_target_processes(self) -> List[psutil.Process]:
+        """仅查找_extra_targets中的进程（宽松模式数学题期间使用，不冻结正常目标）"""
+        with self._extra_targets_lock:
+            extra_targets = set(self._extra_targets)
+        if not extra_targets:
+            return []
+        found = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if self._is_target_process(proc, extra_targets):
+                    found.append(proc)
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                continue
+        return found
+
     def _get_process_tree(self, proc: psutil.Process) -> List[psutil.Process]:
         """获取进程树（父进程+所有子进程）"""
         tree = []
@@ -223,7 +238,12 @@ class ProcessHunter:
 
                 if need_freeze:
                     # 3. 扫描目标进程
-                    target_procs = self._find_target_processes()
+                    #    宽松模式+仅数学题目标时，只扫描_extra_targets（不冻结正常上课用的浏览器）
+                    math_only = self._is_math_lockdown_only()
+                    if math_only:
+                        target_procs = self._find_extra_target_processes()
+                    else:
+                        target_procs = self._find_target_processes()
 
                     # 4. 过滤已经冻结的
                     with self._frozen_lock:
@@ -239,8 +259,8 @@ class ProcessHunter:
                                 self._freeze_process(p)
 
                         # 2. 冻结完成后，在独立线程中触发回调（弹出数学挑战）
-                        #    避免阻塞扫描循环
-                        if self._on_target_detected and not self._is_math_lockdown_only():
+                        #    宽松模式+仅数学题目标时不弹挑战（上课时间，只冻结计算器）
+                        if self._on_target_detected and not math_only:
                             threading.Thread(
                                 target=self._safe_callback,
                                 args=(new_targets,),
@@ -341,16 +361,27 @@ class ProcessHunter:
             if not self._verify_freeze(pid, info) and retry < 2:
                 time.sleep(0.1 * (retry + 1))
                 self.logger.debug(f"冻结验证失败 PID={pid}，重试 {retry + 1}/3")
+                # 清掉占位/记录，让重试能重新占位
                 with self._frozen_lock:
-                    self._frozen.pop(pid, None)
+                    current = self._frozen.get(pid)
+                    if current is info or current is self._FROZEN_PENDING:
+                        self._frozen.pop(pid, None)
                 self._freeze_process(proc, retry=retry + 1)
         else:
             # 所有方式都失败，重试
             if retry < 2:
                 time.sleep(0.1 * (retry + 1))
                 self.logger.debug(f"冻结全部失败 PID={pid}，重试 {retry + 1}/3")
+                # 清掉占位让重试能重新进入
+                with self._frozen_lock:
+                    if self._frozen.get(pid) is self._FROZEN_PENDING:
+                        self._frozen.pop(pid, None)
                 self._freeze_process(proc, retry=retry + 1)
             else:
+                # 彻底失败，清除占位
+                with self._frozen_lock:
+                    if self._frozen.get(pid) is self._FROZEN_PENDING:
+                        self._frozen.pop(pid, None)
                 self.logger.error(f"冻结失败 PID={pid} ({name})，3次重试均未成功")
 
     def _verify_freeze(self, pid: int, info: FrozenProcessInfo) -> bool:
@@ -492,6 +523,9 @@ class ProcessHunter:
             items = list(self._frozen.items())
 
         for pid, info in items:
+            # 跳过PENDING占位（正在冻结中，尚未记录完整信息）
+            if info is self._FROZEN_PENDING or not isinstance(info, FrozenProcessInfo):
+                continue
             try:
                 # 检查进程是否还存在
                 if not psutil.pid_exists(pid):
@@ -528,9 +562,14 @@ class ProcessHunter:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._cleanup_frozen(pid, info)
 
-    def _cleanup_frozen(self, pid: int, info: FrozenProcessInfo):
-        """清理已死亡进程的冻结记录"""
+    def _cleanup_frozen(self, pid: int, info):
+        """清理已死亡进程的冻结记录（info 可能是 PENDING 哨兵）"""
         try:
+            # PENDING 哨兵没有资源可清理，直接跳过
+            if info is self._FROZEN_PENDING or not isinstance(info, FrozenProcessInfo):
+                with self._frozen_lock:
+                    self._frozen.pop(pid, None)
+                return
             # 关闭线程句柄
             if sys.platform == "win32":
                 for h in info.thread_handles.values():

@@ -83,7 +83,7 @@ class TimeGuard:
         return int(h), int(m)
 
     def _is_time_in_range(self, now: datetime, start_str: str, end_str: str) -> bool:
-        """判断当前时间是否在时间段内"""
+        """判断当前时间是否在时间段内（支持跨天：如 22:00-06:00 表示晚22点到次日凌晨6点）"""
         sh, sm = self._parse_time(start_str)
         eh, em = self._parse_time(end_str)
 
@@ -91,7 +91,16 @@ class TimeGuard:
         start_minutes = sh * 60 + sm
         end_minutes = eh * 60 + em
 
-        return start_minutes <= now_minutes < end_minutes
+        if end_minutes == start_minutes:
+            # 起点=终点（配置错误）视为24小时有效
+            return True
+
+        if end_minutes > start_minutes:
+            # 同一天内：[start, end)
+            return start_minutes <= now_minutes < end_minutes
+        else:
+            # 跨天：[start, 24:00) ∪ [00:00, end)
+            return now_minutes >= start_minutes or now_minutes < end_minutes
 
     def _is_class_time_now(self) -> bool:
         """判断当前是否为上课时间"""

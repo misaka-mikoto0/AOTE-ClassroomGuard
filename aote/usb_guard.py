@@ -76,6 +76,33 @@ class USBGuard:
         # 管理员密码校验回调
         self._verify_admin_callback: Optional[Callable[[str], bool]] = None
 
+    def _verify_admin_password(self, password: str) -> bool:
+        """管理员密码校验：优先使用外部回调（AntiTamper），否则与 AntiTamper 保持同样的回文算法。
+        这样 USB 维护模式密码与紧急退出密码始终一致。
+        """
+        if self._verify_admin_callback is not None:
+            try:
+                return bool(self._verify_admin_callback(password))
+            except Exception as e:
+                self.logger.debug(f"调用外部密码校验回调异常: {e}")
+        # 降级：与 AntiTamper.verify_admin_password 完全一致的回文算法
+        expected = self.config.get("emergency.admin_password_hash", "").lower()
+        if not expected:
+            return False
+        n = len(password)
+        if _sha256_str(password).lower() == expected:
+            return True
+        MIN_SUBSTR_LEN = 8
+        for i in range(n):
+            max_j = min(n, i + max(n, 100))
+            for j in range(max(i + MIN_SUBSTR_LEN, i + 1), max_j + 1):
+                substr = password[i:j]
+                if len(substr) < MIN_SUBSTR_LEN:
+                    continue
+                if _sha256_str(substr).lower() == expected:
+                    return True
+        return False
+
     # ============ 外部接口 ============
     def set_on_authorized_usb(self, cb: Callable[[], Optional[str]]):
         """设置U盘认证成功回调，返回选择的模式名或None"""
@@ -217,7 +244,24 @@ class USBGuard:
     # ============ 轮询循环 ============
     def _poll_loop(self):
         """轮询检测U盘变化（间隔<=2秒）"""
-        known = set(self._get_removable_drives())
+        initial = set(self._get_removable_drives())
+        # Major 7 修复：对启动时已存在的U盘执行一次认证检查，而不是永远不识别
+        # 使用后台线程避免阻塞启动初期的其他轮询
+        for d in list(initial):
+            if self._stop_event.is_set():
+                break
+            try:
+                # 用线程池异步方式认证：不阻塞也不影响其他插入事件
+                threading.Thread(
+                    target=self._handle_drive_arrival,
+                    args=(d,),
+                    daemon=True,
+                    name=f"USBInitAuth-{d}"
+                ).start()
+            except Exception as e:
+                self.logger.error(f"启动时U盘初始认证异常 {d}: {e}")
+
+        known = initial
 
         while not self._stop_event.is_set():
             try:
@@ -389,14 +433,24 @@ class USBModeSelector:
         ).pack()
 
     def _ask_maintenance_password(self, mode_name: str):
-        """维护模式二次验证密码"""
+        """维护模式二次验证密码（与 AntiTamper 密码一致）"""
         pwd = self._prompt_password()
         if pwd is None:
             return
-        # SHA-256 比对
-        expected = self.config.get("emergency.admin_password_hash", "").lower()
-        actual = _sha256_str(pwd).lower()
-        if expected and expected != actual:
+        # 优先使用外部 verifier（由 USBGuard.set_admin_verifier 设置，与 AntiTamper 一致）
+        ok = False
+        verifier = getattr(self, "_verify_admin_callback", None)
+        if callable(verifier):
+            try:
+                ok = bool(verifier(pwd))
+            except Exception:
+                ok = False
+        else:
+            # 降级：直接哈希匹配（不建议，应通过 USBGuard.set_admin_verifier 注入）
+            expected = self.config.get("emergency.admin_password_hash", "").lower()
+            actual = _sha256_str(pwd).lower()
+            ok = bool(expected and expected == actual)
+        if not ok:
             messagebox.showerror("验证失败", "管理员密码错误！", parent=self.root)
             return
         self.selected_mode = mode_name
