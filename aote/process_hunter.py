@@ -41,6 +41,17 @@ if sys.platform == "win32":
 
     SW_HIDE = 0
     SW_SHOW = 5
+    SWP_NOSIZE = 0x0001
+    SWP_NOZORDER = 0x0040
+    HWND_TOPMOST = -1
+    OFFSCREEN_X = -32000
+    OFFSCREEN_Y = -32000
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long), ("top", ctypes.c_long),
+            ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+        ]
 
     # 回调类型
     EnumWindowsProc = ctypes.WINFUNCTYPE(
@@ -68,6 +79,8 @@ class FrozenProcessInfo:
     window_handles: List[int] = field(default_factory=list)
     job_handle: Optional[int] = None
     frozen_by: str = "thread"  # thread / window / job
+    original_rects: Dict[int, tuple] = field(default_factory=dict)  # hwnd -> (x, y, w, h)
+    state: str = "normal"  # normal / frozen / unfrozen
 
 
 class ProcessHunter:
@@ -219,18 +232,20 @@ class ProcessHunter:
                         ]
 
                     if new_targets:
-                        # 有新目标，先触发回调（弹出数学挑战）
-                        if self._on_target_detected and not self._is_math_lockdown_only():
-                            try:
-                                self._on_target_detected(new_targets)
-                            except Exception as e:
-                                self.logger.error(f"目标进程回调异常: {e}")
-
-                        # 冻结进程树
+                        # 1. 先冻结进程树（立即隐藏窗口+挂起线程）
                         for proc in new_targets:
                             proctree = self._get_process_tree(proc)
                             for p in proctree:
                                 self._freeze_process(p)
+
+                        # 2. 冻结完成后，在独立线程中触发回调（弹出数学挑战）
+                        #    避免阻塞扫描循环
+                        if self._on_target_detected and not self._is_math_lockdown_only():
+                            threading.Thread(
+                                target=self._safe_callback,
+                                args=(new_targets,),
+                                daemon=True
+                            ).start()
 
                     # 5. 重新冻结被恢复的线程
                     self._recheck_and_refreeze()
@@ -242,6 +257,13 @@ class ProcessHunter:
                 self.logger.error(f"[ProcessHunter] 扫描异常: {e}")
 
             self._stop_event.wait(scan_interval)
+
+    def _safe_callback(self, procs):
+        """安全调用目标检测回调（独立线程中执行）"""
+        try:
+            self._on_target_detected(procs)
+        except Exception as e:
+            self.logger.error(f"目标进程回调异常: {e}")
 
     def _is_math_lockdown_only(self) -> bool:
         """当前是否只有数学题期间的额外目标（不是严格模式）"""
@@ -265,8 +287,8 @@ class ProcessHunter:
                 self.logger.info("[ProcessHunter] 临时解冻到期，恢复严格模式")
 
     # ============ 冻结实现 ============
-    def _freeze_process(self, proc: psutil.Process):
-        """冻结单个进程，优先线程挂起，其次窗口隐藏"""
+    def _freeze_process(self, proc: psutil.Process, retry: int = 0):
+        """冻结单个进程 - 三重保护同时施加（线程挂起 + 窗口隐藏移位 + Job限制）"""
         pid = proc.pid
         try:
             name = proc.name()
@@ -278,38 +300,65 @@ class ProcessHunter:
                 return  # 已冻结
 
         info = FrozenProcessInfo(pid=pid, name=name, freeze_time=datetime.now())
-        success = False
+        methods_used = []
 
-        # 方式1: 线程挂起
+        # 方式1: 线程挂起（阻止CPU执行）
         try:
             if self._suspend_process_threads(proc, info):
-                info.frozen_by = "thread"
-                success = True
+                methods_used.append("thread")
         except Exception as e:
             self.logger.debug(f"线程挂起失败 PID={pid}: {e}")
 
-        # 方式2: 窗口隐藏/禁用
-        if not success:
-            try:
-                if self._hide_process_windows(pid, info):
-                    info.frozen_by = "window"
-                    success = True
-            except Exception as e:
-                self.logger.debug(f"窗口隐藏失败 PID={pid}: {e}")
+        # 方式2: 窗口隐藏 + 移出屏幕 + 禁用输入（阻止用户交互）
+        try:
+            if self._hide_and_displace_windows(pid, info):
+                methods_used.append("window")
+        except Exception as e:
+            self.logger.debug(f"窗口隐藏移位失败 PID={pid}: {e}")
 
-        # 方式3: Job Object UI 限制
-        if not success and sys.platform == "win32":
+        # 方式3: Job Object UI 限制（系统级限制）
+        if sys.platform == "win32":
             try:
                 if self._apply_job_restrictions(proc, info):
-                    info.frozen_by = "job"
-                    success = True
+                    methods_used.append("job")
             except Exception as e:
                 self.logger.debug(f"Job限制失败 PID={pid}: {e}")
 
-        if success:
+        if methods_used:
+            info.frozen_by = "+".join(methods_used)
+            info.state = "frozen"
             with self._frozen_lock:
                 self._frozen[pid] = info
             self.logger.log_process_freeze(pid, name, reason=f"method_{info.frozen_by}")
+
+            # 验证冻结是否成功
+            if not self._verify_freeze(pid, info) and retry < 2:
+                time.sleep(0.1 * (retry + 1))
+                self.logger.debug(f"冻结验证失败 PID={pid}，重试 {retry + 1}/3")
+                with self._frozen_lock:
+                    self._frozen.pop(pid, None)
+                self._freeze_process(proc, retry=retry + 1)
+        else:
+            # 所有方式都失败，重试
+            if retry < 2:
+                time.sleep(0.1 * (retry + 1))
+                self.logger.debug(f"冻结全部失败 PID={pid}，重试 {retry + 1}/3")
+                self._freeze_process(proc, retry=retry + 1)
+            else:
+                self.logger.error(f"冻结失败 PID={pid} ({name})，3次重试均未成功")
+
+    def _verify_freeze(self, pid: int, info: FrozenProcessInfo) -> bool:
+        """验证冻结是否成功：窗口不可见 + 线程已挂起"""
+        if not sys.platform == "win32":
+            return True
+        try:
+            # 检查窗口是否仍然可见
+            for hwnd in info.window_handles:
+                if user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
+                    return False
+            return True
+        except Exception:
+            return True
 
     def _suspend_process_threads(self, proc: psutil.Process, info: FrozenProcessInfo) -> bool:
         """挂起进程所有线程"""
@@ -336,8 +385,8 @@ class ProcessHunter:
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             return False
 
-    def _hide_process_windows(self, pid: int, info: FrozenProcessInfo) -> bool:
-        """隐藏属于该PID的所有窗口"""
+    def _hide_and_displace_windows(self, pid: int, info: FrozenProcessInfo) -> bool:
+        """隐藏窗口 + 移出屏幕 + 禁用输入，并保存原始位置"""
         if not sys.platform == "win32":
             return False
 
@@ -347,15 +396,26 @@ class ProcessHunter:
             found_pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
             if found_pid.value == pid:
+                hwnd_int = int(hwnd)
+                # 保存原始窗口位置
+                rect = RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    info.original_rects[hwnd_int] = (
+                        rect.left, rect.top,
+                        rect.right - rect.left, rect.bottom - rect.top
+                    )
                 # 隐藏窗口
                 user32.ShowWindow(hwnd, SW_HIDE)
                 # 禁用输入
                 user32.EnableWindow(hwnd, False)
-                found_windows.append(int(hwnd))
+                # 移出可视区域（负坐标）
+                user32.SetWindowPos(hwnd, None, OFFSCREEN_X, OFFSCREEN_Y,
+                                    0, 0, SWP_NOSIZE | SWP_NOZORDER)
+                found_windows.append(hwnd_int)
             return True
 
-        proc = EnumWindowsProc(enum_callback)
-        user32.EnumWindows(proc, 0)
+        proc_cb = EnumWindowsProc(enum_callback)
+        user32.EnumWindows(proc_cb, 0)
 
         # 也枚举子窗口
         def child_callback(hwnd, lparam):
@@ -418,7 +478,7 @@ class ProcessHunter:
             return False
 
     def _recheck_and_refreeze(self):
-        """重新检查被冻结进程，重新冻结被恢复的线程"""
+        """重新检查被冻结进程，重新冻结被恢复的线程和窗口"""
         if not sys.platform == "win32":
             return
 
@@ -427,15 +487,15 @@ class ProcessHunter:
 
         for pid, info in items:
             try:
-                if info.frozen_by == "thread" and info.thread_handles:
-                    # 检查进程是否还存在
-                    if not psutil.pid_exists(pid):
-                        self._cleanup_frozen(pid, info)
-                        continue
-                    # 重新挂起可能被恢复的线程
+                # 检查进程是否还存在
+                if not psutil.pid_exists(pid):
+                    self._cleanup_frozen(pid, info)
+                    continue
+
+                # 1. 重新挂起被恢复的线程 + 新线程
+                if info.thread_handles:
                     proc = psutil.Process(pid)
                     current_tids = {t.id for t in proc.threads()}
-                    # 对新出现的线程也挂起
                     for tid in current_tids:
                         if tid not in info.thread_handles:
                             try:
@@ -447,6 +507,18 @@ class ProcessHunter:
                                         kernel32.CloseHandle(h)
                             except Exception:
                                 pass
+
+                # 2. 重新隐藏被显示的窗口 + 重新移出屏幕
+                for hwnd in info.window_handles:
+                    try:
+                        if user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
+                            user32.ShowWindow(hwnd, SW_HIDE)
+                            user32.EnableWindow(hwnd, False)
+                            user32.SetWindowPos(hwnd, None, OFFSCREEN_X, OFFSCREEN_Y,
+                                                0, 0, SWP_NOSIZE | SWP_NOZORDER)
+                    except Exception:
+                        pass
+
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._cleanup_frozen(pid, info)
 
@@ -480,7 +552,7 @@ class ProcessHunter:
             self.unfreeze_process(pid, reason)
 
     def unfreeze_process(self, pid: int, reason: str = "unlock"):
-        """解冻单个进程"""
+        """解冻单个进程，恢复窗口原始位置"""
         with self._frozen_lock:
             info = self._frozen.pop(pid, None)
         if not info:
@@ -488,8 +560,8 @@ class ProcessHunter:
 
         duration = int((datetime.now() - info.freeze_time).total_seconds())
 
-        # 方式1: 恢复线程
         if sys.platform == "win32":
+            # 1. 恢复线程
             for h in info.thread_handles.values():
                 try:
                     kernel32.ResumeThread(h)
@@ -497,21 +569,29 @@ class ProcessHunter:
                 except Exception:
                     pass
 
-            # 方式2: 恢复窗口
+            # 2. 恢复窗口位置 + 显示 + 启用
             for hwnd in info.window_handles:
                 try:
-                    user32.ShowWindow(hwnd, SW_SHOW)
-                    user32.EnableWindow(hwnd, True)
+                    if user32.IsWindow(hwnd):
+                        # 恢复原始位置
+                        if hwnd in info.original_rects:
+                            x, y, w, h = info.original_rects[hwnd]
+                            user32.SetWindowPos(hwnd, None, x, y, 0, 0,
+                                                SWP_NOSIZE | SWP_NOZORDER)
+                        # 显示并启用
+                        user32.ShowWindow(hwnd, SW_SHOW)
+                        user32.EnableWindow(hwnd, True)
                 except Exception:
                     pass
 
-            # 方式3: 关闭Job Object句柄（进程自动脱离）
+            # 3. 关闭Job Object句柄（进程自动脱离）
             if info.job_handle:
                 try:
                     kernel32.CloseHandle(info.job_handle)
                 except Exception:
                     pass
 
+        info.state = "unfrozen"
         self.logger.log_process_unfreeze(pid, info.name, duration_seconds=duration)
 
     # ============ 生命周期 ============

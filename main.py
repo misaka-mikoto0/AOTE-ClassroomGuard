@@ -87,10 +87,12 @@ def acquire_process_lock(lock_name: str) -> bool:
         return True
     try:
         import ctypes
-        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, lock_name)
+        # use_last_error=True 确保正确捕获 CreateMutexW 的错误码
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        mutex = kernel32.CreateMutexW(None, False, lock_name)
         # ERROR_ALREADY_EXISTS = 183
-        if ctypes.windll.kernel32.GetLastError() == 183:
-            ctypes.windll.kernel32.CloseHandle(mutex)
+        if ctypes.get_last_error() == 183:
+            kernel32.CloseHandle(mutex)
             return False
         # 保持 mutex 句柄不关闭，进程退出时自动释放
         return True
