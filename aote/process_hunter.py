@@ -287,6 +287,9 @@ class ProcessHunter:
                 self.logger.info("[ProcessHunter] 临时解冻到期，恢复严格模式")
 
     # ============ 冻结实现 ============
+    # 用于占位的哨兵：pid -> True 表示"正在冻结中"，防止并发重复冻结
+    _FROZEN_PENDING = "__PENDING__"
+
     def _freeze_process(self, proc: psutil.Process, retry: int = 0):
         """冻结单个进程 - 三重保护同时施加（线程挂起 + 窗口隐藏移位 + Job限制）"""
         pid = proc.pid
@@ -295,9 +298,12 @@ class ProcessHunter:
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             name = "unknown"
 
+        # 先加锁做原子检查+占位，避免并发双重冻结（Critical Issue 1）
         with self._frozen_lock:
             if pid in self._frozen:
-                return  # 已冻结
+                return  # 已冻结或正在冻结中
+            # 占位：标记为冻结中，防止其他线程重复进入
+            self._frozen[pid] = self._FROZEN_PENDING
 
         info = FrozenProcessInfo(pid=pid, name=name, freeze_time=datetime.now())
         methods_used = []
