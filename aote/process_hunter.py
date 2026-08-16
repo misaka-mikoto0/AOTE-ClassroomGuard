@@ -1,0 +1,538 @@
+"""
+AOTE 管控系统 - 进程监控与冻结模块（Process Hunter）
+非上课时段持续扫描并冻结目标进程（浏览器、视频、游戏等）
+支持线程挂起、窗口隐藏、Job Object 三重保护
+"""
+import psutil
+import threading
+import time
+import ctypes
+import sys
+from ctypes import wintypes
+from typing import Dict, List, Set, Optional, Callable
+from dataclasses import dataclass, field
+from datetime import datetime
+
+from .config import ConfigManager
+from .logger import AOTELogger
+from .time_guard import TimeGuard
+
+
+# ================ Windows API 声明 ================
+if sys.platform == "win32":
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    # 进程/线程访问权限
+    PROCESS_ALL_ACCESS = 0x1F0FFF
+    THREAD_ALL_ACCESS = 0x1F03FF
+    THREAD_SUSPEND_RESUME = 0x0002
+
+    # Job Object
+    JOB_OBJECT_UILIMIT_HANDLES = 0x00000001
+    JOB_OBJECT_UILIMIT_READCLIPBOARD = 0x00000002
+    JOB_OBJECT_UILIMIT_WRITECLIPBOARD = 0x00000004
+    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS = 0x00000008
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS = 0x00000010
+    JOB_OBJECT_UILIMIT_GLOBALATOMS = 0x00000020
+    JOB_OBJECT_UILIMIT_DESKTOP = 0x00000040
+    JOB_OBJECT_UILIMIT_EXITWINDOWS = 0x00000080
+    JobObjectBasicUIRestrictions = 4
+
+    SW_HIDE = 0
+    SW_SHOW = 5
+
+    # 回调类型
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM
+    )
+    EnumChildProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM
+    )
+
+    class JOBOBJECT_BASIC_UI_RESTRICTIONS(ctypes.Structure):
+        _fields_ = [("UIRestrictionsClass", wintypes.DWORD)]
+
+
+@dataclass
+class FrozenProcessInfo:
+    """冻结进程的状态信息"""
+    pid: int
+    name: str
+    freeze_time: datetime
+    thread_handles: Dict[int, int] = field(default_factory=dict)  # TID -> handle
+    window_handles: List[int] = field(default_factory=list)
+    job_handle: Optional[int] = None
+    frozen_by: str = "thread"  # thread / window / job
+
+
+class ProcessHunter:
+    """进程猎手：监控并冻结目标进程"""
+
+    def __init__(self, config: ConfigManager, logger: AOTELogger, time_guard: TimeGuard):
+        self.config = config
+        self.logger = logger
+        self.time_guard = time_guard
+
+        # 冻结状态表: PID -> FrozenProcessInfo
+        self._frozen: Dict[int, FrozenProcessInfo] = {}
+        self._frozen_lock = threading.RLock()
+
+        # 控制标志
+        self._stop_event = threading.Event()
+        self._scan_thread: Optional[threading.Thread] = None
+
+        # 临时解冻状态: (expire_timestamp, None=永久)
+        self._temporary_unlock_until: Optional[float] = None
+        self._unlock_lock = threading.RLock()
+
+        # 额外的进程黑名单（数学题期间动态添加）
+        self._extra_targets: Set[str] = set()
+        self._extra_targets_lock = threading.Lock()
+
+        # 新进程发现回调（用于触发数学挑战）
+        self._on_target_detected: Optional[Callable[[List[psutil.Process]], None]] = None
+
+    # ============ 外部接口 ============
+    def set_on_target_detected(self, callback: Callable[[List[psutil.Process]], None]):
+        """设置目标进程发现回调"""
+        self._on_target_detected = callback
+
+    def set_extra_targets(self, processes: List[str]):
+        """设置额外需要冻结的进程（如数学题期间冻结计算器）"""
+        with self._extra_targets_lock:
+            self._extra_targets = set(p.lower() for p in processes)
+        self.logger.info(f"[ProcessHunter] 新增冻结目标: {list(self._extra_targets)}")
+
+    def clear_extra_targets(self):
+        """清除额外冻结目标"""
+        with self._extra_targets_lock:
+            removed = list(self._extra_targets)
+            self._extra_targets.clear()
+        self.logger.info(f"[ProcessHunter] 清除额外冻结目标: {removed}")
+
+    def temporary_unlock(self, seconds: int):
+        """临时解冻所有进程，seconds秒后恢复"""
+        with self._unlock_lock:
+            expire = time.time() + seconds
+            self._temporary_unlock_until = expire
+        # 立即解冻所有
+        self.unfreeze_all(reason=f"temp_unlock_{seconds}s")
+        self.logger.info(f"[ProcessHunter] 临时解冻 {seconds} 秒")
+
+    def permanent_unlock(self):
+        """永久解冻（直到下次重启或手动恢复）"""
+        with self._unlock_lock:
+            self._temporary_unlock_until = float("inf")
+        self.unfreeze_all(reason="permanent_unlock")
+        self.logger.info("[ProcessHunter] 永久解冻（维护模式）")
+
+    def restore_strict_mode(self):
+        """立即恢复严格模式（取消临时解冻）"""
+        with self._unlock_lock:
+            self._temporary_unlock_until = None
+        self.logger.info("[ProcessHunter] 恢复严格模式")
+
+    @property
+    def is_unlocked(self) -> bool:
+        """当前是否处于解冻状态"""
+        with self._unlock_lock:
+            if self._temporary_unlock_until is None:
+                return False
+            if self._temporary_unlock_until == float("inf"):
+                return True
+            return time.time() < self._temporary_unlock_until
+
+    # ============ 核心扫描循环 ============
+    def _get_target_names(self) -> Set[str]:
+        """获取当前所有需要冻结的进程名"""
+        targets = set(self.config.all_target_processes)
+        with self._extra_targets_lock:
+            targets.update(self._extra_targets)
+        return targets
+
+    def _is_target_process(self, proc: psutil.Process, targets: Set[str]) -> bool:
+        """判断进程是否在目标名单中"""
+        try:
+            name = proc.name().lower()
+            if name in targets:
+                return True
+            # 也检查路径中的进程名
+            try:
+                exe_path = proc.exe().lower()
+                for t in targets:
+                    if t in exe_path:
+                        return True
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+        return False
+
+    def _find_target_processes(self) -> List[psutil.Process]:
+        """查找所有运行中的目标进程"""
+        targets = self._get_target_names()
+        found = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if self._is_target_process(proc, targets):
+                    found.append(proc)
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                continue
+        return found
+
+    def _get_process_tree(self, proc: psutil.Process) -> List[psutil.Process]:
+        """获取进程树（父进程+所有子进程）"""
+        tree = []
+        try:
+            tree.append(proc)
+            children = proc.children(recursive=True)
+            tree.extend(children)
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+        return tree
+
+    def _scan_loop(self):
+        """主扫描循环"""
+        scan_interval = float(self.config.get("process_hunter.scan_interval", 0.5))
+
+        while not self._stop_event.is_set():
+            try:
+                # 1. 检查临时解冻是否到期
+                self._check_unlock_expiry()
+
+                # 2. 判断是否需要冻结
+                need_freeze = self._should_freeze_now()
+
+                if need_freeze:
+                    # 3. 扫描目标进程
+                    target_procs = self._find_target_processes()
+
+                    # 4. 过滤已经冻结的
+                    with self._frozen_lock:
+                        new_targets = [
+                            p for p in target_procs if p.pid not in self._frozen
+                        ]
+
+                    if new_targets:
+                        # 有新目标，先触发回调（弹出数学挑战）
+                        if self._on_target_detected and not self._is_math_lockdown_only():
+                            try:
+                                self._on_target_detected(new_targets)
+                            except Exception as e:
+                                self.logger.error(f"目标进程回调异常: {e}")
+
+                        # 冻结进程树
+                        for proc in new_targets:
+                            proctree = self._get_process_tree(proc)
+                            for p in proctree:
+                                self._freeze_process(p)
+
+                    # 5. 重新冻结被恢复的线程
+                    self._recheck_and_refreeze()
+                else:
+                    # 宽松模式或解锁状态 - 不冻结，但保持记录
+                    pass
+
+            except Exception as e:
+                self.logger.error(f"[ProcessHunter] 扫描异常: {e}")
+
+            self._stop_event.wait(scan_interval)
+
+    def _is_math_lockdown_only(self) -> bool:
+        """当前是否只有数学题期间的额外目标（不是严格模式）"""
+        return self.time_guard.is_relaxed_mode and bool(self._extra_targets)
+
+    def _should_freeze_now(self) -> bool:
+        """判断当前是否应该执行冻结"""
+        # 如果显式解锁中，不冻结
+        if self.is_unlocked:
+            return False
+        # 严格模式或有额外目标，就需要冻结
+        return self.time_guard.is_strict_mode or self.time_guard.current_mode == TimeGuard.MODE_EMERGENCY or bool(self._extra_targets)
+
+    def _check_unlock_expiry(self):
+        """检查临时解冻是否到期"""
+        with self._unlock_lock:
+            if (self._temporary_unlock_until is not None
+                    and self._temporary_unlock_until != float("inf")
+                    and time.time() >= self._temporary_unlock_until):
+                self._temporary_unlock_until = None
+                self.logger.info("[ProcessHunter] 临时解冻到期，恢复严格模式")
+
+    # ============ 冻结实现 ============
+    def _freeze_process(self, proc: psutil.Process):
+        """冻结单个进程，优先线程挂起，其次窗口隐藏"""
+        pid = proc.pid
+        try:
+            name = proc.name()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            name = "unknown"
+
+        with self._frozen_lock:
+            if pid in self._frozen:
+                return  # 已冻结
+
+        info = FrozenProcessInfo(pid=pid, name=name, freeze_time=datetime.now())
+        success = False
+
+        # 方式1: 线程挂起
+        try:
+            if self._suspend_process_threads(proc, info):
+                info.frozen_by = "thread"
+                success = True
+        except Exception as e:
+            self.logger.debug(f"线程挂起失败 PID={pid}: {e}")
+
+        # 方式2: 窗口隐藏/禁用
+        if not success:
+            try:
+                if self._hide_process_windows(pid, info):
+                    info.frozen_by = "window"
+                    success = True
+            except Exception as e:
+                self.logger.debug(f"窗口隐藏失败 PID={pid}: {e}")
+
+        # 方式3: Job Object UI 限制
+        if not success and sys.platform == "win32":
+            try:
+                if self._apply_job_restrictions(proc, info):
+                    info.frozen_by = "job"
+                    success = True
+            except Exception as e:
+                self.logger.debug(f"Job限制失败 PID={pid}: {e}")
+
+        if success:
+            with self._frozen_lock:
+                self._frozen[pid] = info
+            self.logger.log_process_freeze(pid, name, reason=f"method_{info.frozen_by}")
+
+    def _suspend_process_threads(self, proc: psutil.Process, info: FrozenProcessInfo) -> bool:
+        """挂起进程所有线程"""
+        if not sys.platform == "win32":
+            return False
+
+        try:
+            threads = proc.threads()
+            suspended_any = False
+            for t in threads:
+                tid = t.id
+                try:
+                    h_thread = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, tid)
+                    if h_thread:
+                        result = kernel32.SuspendThread(h_thread)
+                        if result != -1:
+                            info.thread_handles[tid] = h_thread
+                            suspended_any = True
+                        else:
+                            kernel32.CloseHandle(h_thread)
+                except Exception:
+                    continue
+            return suspended_any
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            return False
+
+    def _hide_process_windows(self, pid: int, info: FrozenProcessInfo) -> bool:
+        """隐藏属于该PID的所有窗口"""
+        if not sys.platform == "win32":
+            return False
+
+        found_windows = []
+
+        def enum_callback(hwnd, lparam):
+            found_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
+            if found_pid.value == pid:
+                # 隐藏窗口
+                user32.ShowWindow(hwnd, SW_HIDE)
+                # 禁用输入
+                user32.EnableWindow(hwnd, False)
+                found_windows.append(int(hwnd))
+            return True
+
+        proc = EnumWindowsProc(enum_callback)
+        user32.EnumWindows(proc, 0)
+
+        # 也枚举子窗口
+        def child_callback(hwnd, lparam):
+            found_windows.append(int(hwnd))
+            user32.ShowWindow(hwnd, SW_HIDE)
+            return True
+
+        for hwnd in list(found_windows):
+            child_proc = EnumChildProc(child_callback)
+            user32.EnumChildWindows(hwnd, child_proc, 0)
+
+        info.window_handles = found_windows
+        return len(found_windows) > 0
+
+    def _apply_job_restrictions(self, proc: psutil.Process, info: FrozenProcessInfo) -> bool:
+        """通过Job Object施加UI限制"""
+        if not sys.platform == "win32":
+            return False
+        try:
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return False
+
+            ui_restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS()
+            ui_restrictions.UIRestrictionsClass = (
+                JOB_OBJECT_UILIMIT_HANDLES |
+                JOB_OBJECT_UILIMIT_READCLIPBOARD |
+                JOB_OBJECT_UILIMIT_WRITECLIPBOARD |
+                JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS |
+                JOB_OBJECT_UILIMIT_DESKTOP |
+                JOB_OBJECT_UILIMIT_EXITWINDOWS
+            )
+
+            result = kernel32.SetInformationJobObject(
+                job,
+                JobObjectBasicUIRestrictions,
+                ctypes.byref(ui_restrictions),
+                ctypes.sizeof(ui_restrictions)
+            )
+            if not result:
+                kernel32.CloseHandle(job)
+                return False
+
+            # 获取进程句柄
+            h_proc = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, proc.pid)
+            if not h_proc:
+                kernel32.CloseHandle(job)
+                return False
+
+            result = kernel32.AssignProcessToJobObject(job, h_proc)
+            kernel32.CloseHandle(h_proc)
+
+            if result:
+                info.job_handle = job
+                return True
+            else:
+                kernel32.CloseHandle(job)
+                return False
+        except Exception:
+            return False
+
+    def _recheck_and_refreeze(self):
+        """重新检查被冻结进程，重新冻结被恢复的线程"""
+        if not sys.platform == "win32":
+            return
+
+        with self._frozen_lock:
+            items = list(self._frozen.items())
+
+        for pid, info in items:
+            try:
+                if info.frozen_by == "thread" and info.thread_handles:
+                    # 检查进程是否还存在
+                    if not psutil.pid_exists(pid):
+                        self._cleanup_frozen(pid, info)
+                        continue
+                    # 重新挂起可能被恢复的线程
+                    proc = psutil.Process(pid)
+                    current_tids = {t.id for t in proc.threads()}
+                    # 对新出现的线程也挂起
+                    for tid in current_tids:
+                        if tid not in info.thread_handles:
+                            try:
+                                h = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, tid)
+                                if h:
+                                    if kernel32.SuspendThread(h) != -1:
+                                        info.thread_handles[tid] = h
+                                    else:
+                                        kernel32.CloseHandle(h)
+                            except Exception:
+                                pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                self._cleanup_frozen(pid, info)
+
+    def _cleanup_frozen(self, pid: int, info: FrozenProcessInfo):
+        """清理已死亡进程的冻结记录"""
+        try:
+            # 关闭线程句柄
+            if sys.platform == "win32":
+                for h in info.thread_handles.values():
+                    try:
+                        kernel32.CloseHandle(h)
+                    except Exception:
+                        pass
+                if info.job_handle:
+                    try:
+                        kernel32.CloseHandle(info.job_handle)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            with self._frozen_lock:
+                self._frozen.pop(pid, None)
+
+    # ============ 解冻实现 ============
+    def unfreeze_all(self, reason: str = "unlock"):
+        """解冻所有冻结的进程"""
+        with self._frozen_lock:
+            pids = list(self._frozen.keys())
+        for pid in pids:
+            self.unfreeze_process(pid, reason)
+
+    def unfreeze_process(self, pid: int, reason: str = "unlock"):
+        """解冻单个进程"""
+        with self._frozen_lock:
+            info = self._frozen.pop(pid, None)
+        if not info:
+            return
+
+        duration = int((datetime.now() - info.freeze_time).total_seconds())
+
+        # 方式1: 恢复线程
+        if sys.platform == "win32":
+            for h in info.thread_handles.values():
+                try:
+                    kernel32.ResumeThread(h)
+                    kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+
+            # 方式2: 恢复窗口
+            for hwnd in info.window_handles:
+                try:
+                    user32.ShowWindow(hwnd, SW_SHOW)
+                    user32.EnableWindow(hwnd, True)
+                except Exception:
+                    pass
+
+            # 方式3: 关闭Job Object句柄（进程自动脱离）
+            if info.job_handle:
+                try:
+                    kernel32.CloseHandle(info.job_handle)
+                except Exception:
+                    pass
+
+        self.logger.log_process_unfreeze(pid, info.name, duration_seconds=duration)
+
+    # ============ 生命周期 ============
+    def start(self):
+        """启动进程监控线程"""
+        if self._scan_thread and self._scan_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._scan_thread = threading.Thread(
+            target=self._scan_loop,
+            daemon=True,
+            name="ProcessHunter"
+        )
+        self._scan_thread.start()
+        self.logger.info("[ProcessHunter] 进程监控模块已启动")
+
+    def stop(self):
+        """停止监控并解冻所有进程"""
+        self._stop_event.set()
+        if self._scan_thread:
+            self._scan_thread.join(timeout=2)
+        # 清理
+        self.unfreeze_all(reason="shutdown")
+        self.logger.info("[ProcessHunter] 进程监控模块已停止")

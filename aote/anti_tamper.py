@@ -1,0 +1,339 @@
+"""
+AOTE 管控系统 - 防绕过与自保护模块（Anti-Tamper）
+功能：
+- 双进程守护（互相监控，3秒内复活）
+- 多重自启动（注册表、计划任务）
+- 扩展心跳检测（30秒超时进入紧急模式）
+- 紧急退出快捷键 + 密码验证
+"""
+import os
+import sys
+import time
+import json
+import hashlib
+import subprocess
+import threading
+import ctypes
+import tempfile
+from pathlib import Path
+from typing import Callable, Optional
+
+from .config import ConfigManager
+from .logger import AOTELogger
+from .time_guard import TimeGuard
+
+
+def sha256_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+class AntiTamper:
+    """防绕过与自保护模块"""
+
+    def __init__(self, config: ConfigManager, logger: AOTELogger, time_guard: TimeGuard):
+        self.config = config
+        self.logger = logger
+        self.time_guard = time_guard
+
+        # 心跳
+        self._last_extension_heartbeat = time.time()
+        self._heartbeat_timeout = int(config.get("http_server.extension_heartbeat_timeout", 30))
+
+        # 控制
+        self._stop_event = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+
+        # 紧急退出回调
+        self._on_emergency_exit: Optional[Callable[[], None]] = None
+        # 强制退出（非管理员方式）回调
+        self._on_force_kill_detected: Optional[Callable[[], None]] = None
+
+        # 本进程标识
+        self._is_watchdog = False  # 是否为守护进程（主/副区分）
+        self._partner_pid: Optional[int] = None
+
+    # ============ 外部接口 ============
+    def set_on_emergency_exit(self, cb: Callable[[], None]):
+        """设置紧急退出回调（管理员快捷键）"""
+        self._on_emergency_exit = cb
+
+    def set_on_force_kill(self, cb: Callable[[], None]):
+        """设置检测到对方进程被杀时的回调（复活对方）"""
+        self._on_force_kill_detected = cb
+
+    def set_partner_pid(self, pid: Optional[int]):
+        """设置对端进程ID（双进程守护）"""
+        self._partner_pid = pid
+
+    def mark_as_watchdog(self, is_watchdog: bool):
+        self._is_watchdog = is_watchdog
+
+    def report_extension_heartbeat(self):
+        """浏览器扩展上报心跳"""
+        self._last_extension_heartbeat = time.time()
+
+    def verify_admin_password(self, password: str) -> bool:
+        """校验管理员密码（SHA-256对比）"""
+        expected = self.config.get("emergency.admin_password_hash", "").lower()
+        if not expected:
+            return False
+        actual = sha256_str(password).lower()
+        result = (expected == actual)
+        self.logger.log_admin_action("password_verify", result)
+        return result
+
+    # ============ 自启动安装 ============
+    def install_autostart(self):
+        """安装多重自启动保险"""
+        script_path = self._get_self_script_path()
+        if not script_path:
+            return
+        self._install_registry_run(script_path)
+        self._install_registry_runonce(script_path)
+        self._install_scheduled_task()
+        self.logger.info("[AntiTamper] 自启动机制已安装")
+
+    def _get_self_script_path(self) -> Optional[str]:
+        """获取当前启动脚本路径"""
+        try:
+            if getattr(sys, "frozen", False):
+                # PyInstaller 打包
+                return os.path.abspath(sys.executable)
+            else:
+                return os.path.abspath(sys.argv[0])
+        except Exception:
+            return None
+
+    def _install_registry_run(self, target: str):
+        """注册表 HKLM\\...\\Run 自启动"""
+        if sys.platform != "win32":
+            return
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_SET_VALUE
+            )
+            winreg.SetValueEx(key, "AOTE_Guardian", 0, winreg.REG_SZ, f'"{target}" --daemon')
+            winreg.CloseKey(key)
+        except Exception as e:
+            self.logger.debug(f"注册表Run安装失败: {e}")
+
+    def _install_registry_runonce(self, target: str):
+        """注册表 RunOnce（复活备用）"""
+        if sys.platform != "win32":
+            return
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                0, winreg.KEY_SET_VALUE
+            )
+            winreg.SetValueEx(key, "AOTE_Respawn", 0, winreg.REG_SZ, f'"{target}" --daemon')
+            winreg.CloseKey(key)
+        except Exception as e:
+            self.logger.debug(f"注册表RunOnce安装失败: {e}")
+
+    def _install_scheduled_task(self):
+        """安装计划任务（每5分钟检查进程）"""
+        if sys.platform != "win32":
+            return
+        target = self._get_self_script_path()
+        if not target:
+            return
+        # 创建 schtasks 命令
+        task_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>AOTE Guardian Respawn</Description></RegistrationInfo>
+  <Triggers><TimeTrigger><Repetition><Interval>PT5M</Interval><Duration>P1D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2026-01-01T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>
+  <Principals><Principal id="Author"><RunLevel>HighestAvailable</RunLevel><UserId>S-1-5-18</UserId></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession><UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority></Settings>
+  <Actions Context="Author"><Exec><Command>"{target}"</Command><Arguments>--respawn-check</Arguments></Exec></Actions>
+</Task>"""
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-16") as f:
+                f.write(task_xml)
+                xml_path = f.name
+            subprocess.run(
+                ["schtasks", "/Create", "/TN", "AOTE Guardian", "/XML", xml_path, "/F"],
+                capture_output=True, timeout=15
+            )
+            os.unlink(xml_path)
+        except Exception as e:
+            self.logger.debug(f"计划任务安装失败: {e}")
+
+    # ============ 监控循环 ============
+    def _monitor_loop(self):
+        interval = int(self.config.get("watchdog.monitor_interval", 2))
+
+        while not self._stop_event.is_set():
+            try:
+                # 1. 扩展心跳超时检查
+                self._check_extension_heartbeat()
+
+                # 2. 对方进程存活检查（双进程守护）
+                self._check_partner_alive()
+
+            except Exception as e:
+                self.logger.error(f"[AntiTamper] 监控异常: {e}")
+
+            self._stop_event.wait(interval)
+
+    def _check_extension_heartbeat(self):
+        """检查扩展心跳，超时则进入紧急模式"""
+        elapsed = time.time() - self._last_extension_heartbeat
+        if elapsed > self._heartbeat_timeout:
+            if self.time_guard.current_mode != TimeGuard.MODE_EMERGENCY:
+                self.logger.log_anti_tamper(
+                    "extension_heartbeat_lost",
+                    f"扩展心跳超时 {int(elapsed)}s，进入紧急模式"
+                )
+                self.time_guard.enter_emergency_mode("extension_heartbeat_lost")
+
+    def _check_partner_alive(self):
+        """检查对端进程是否存活"""
+        if not self._partner_pid:
+            return
+        try:
+            import psutil
+            if not psutil.pid_exists(self._partner_pid):
+                raise psutil.NoSuchProcess(self._partner_pid)
+            # 再确认
+            proc = psutil.Process(self._partner_pid)
+            if not proc.is_running():
+                raise Exception("not running")
+        except Exception:
+            # 对端进程已死
+            self.logger.log_anti_tamper(
+                "partner_killed",
+                f"对端进程 {self._partner_pid} 已死亡，准备复活"
+            )
+            # 重启延迟
+            delay = int(self.config.get("watchdog.restart_delay", 1))
+            threading.Timer(delay, self._respawn_partner).start()
+
+    def _respawn_partner(self):
+        """复活对端进程"""
+        try:
+            script = self._get_self_script_path()
+            if not script:
+                return
+            target = sys.executable if script.endswith(".py") else script
+            args = [target]
+            if script.endswith(".py"):
+                args.append(script)
+            # 如果我是watchdog，则复活主进程；反之复活watchdog
+            if self._is_watchdog:
+                args.append("--main")
+            else:
+                args.append("--watchdog")
+
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+
+            proc = subprocess.Popen(
+                args,
+                creationflags=creationflags,
+                close_fds=True
+            )
+            self._partner_pid = proc.pid
+            self.logger.log_anti_tamper(
+                "partner_respawned",
+                f"已复活对端进程，新PID={proc.pid}"
+            )
+            if self._on_force_kill_detected:
+                try:
+                    self._on_force_kill_detected()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.error(f"复活对端进程失败: {e}")
+
+    # ============ 紧急退出验证 ============
+    def show_emergency_exit_dialog(self) -> bool:
+        """弹出管理员密码验证框，通过则返回True"""
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+
+        result = {"ok": False}
+
+        def _dlg():
+            dlg = tk.Tk()
+            dlg.title("紧急退出 - 管理员验证")
+            dlg.attributes("-topmost", True)
+            dlg.geometry("400x220")
+            dlg.resizable(False, False)
+            dlg.configure(bg="#660022")
+
+            tk.Label(
+                dlg, text="⚠ 紧急退出系统",
+                font=("Microsoft YaHei", 16, "bold"),
+                fg="white", bg="#660022"
+            ).pack(pady=(20, 5))
+            tk.Label(
+                dlg, text="请输入管理员密码以完全退出管控系统",
+                font=("Microsoft YaHei", 10),
+                fg="#ffcccc", bg="#660022"
+            ).pack(pady=(0, 12))
+
+            entry = ttk.Entry(dlg, show="*", font=("Consolas", 14), width=24, justify=tk.CENTER)
+            entry.pack(pady=5)
+            entry.focus_set()
+
+            def _ok():
+                pwd = entry.get()
+                if self.verify_admin_password(pwd):
+                    result["ok"] = True
+                    dlg.destroy()
+                else:
+                    messagebox.showerror("验证失败", "密码错误！", parent=dlg)
+                    entry.delete(0, tk.END)
+                    self.logger.log_admin_action("emergency_exit", False)
+
+            def _cancel():
+                dlg.destroy()
+
+            btn_frame = tk.Frame(dlg, bg="#660022")
+            btn_frame.pack(pady=18)
+            tk.Button(
+                btn_frame, text="确认退出", font=("Microsoft YaHei", 11, "bold"),
+                bg="#0078d7", fg="white", relief=tk.FLAT,
+                padx=20, pady=6, command=_ok
+            ).pack(side=tk.LEFT, padx=10)
+            tk.Button(
+                btn_frame, text="取消", font=("Microsoft YaHei", 11),
+                bg="#ccc", fg="#333", relief=tk.FLAT,
+                padx=20, pady=6, command=_cancel
+            ).pack(side=tk.LEFT, padx=10)
+
+            entry.bind("<Return>", lambda e: _ok())
+            entry.bind("<Escape>", lambda e: _cancel())
+            dlg.mainloop()
+
+        t = threading.Thread(target=_dlg, daemon=True)
+        t.start()
+        t.join(timeout=60)
+        return result["ok"]
+
+    # ============ 生命周期 ============
+    def start(self):
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._last_extension_heartbeat = time.time()  # 启动即算一次心跳
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop,
+            daemon=True,
+            name="AntiTamper"
+        )
+        self._monitor_thread.start()
+        self.logger.info("[AntiTamper] 防绕过模块已启动")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=3)
+        self.logger.info("[AntiTamper] 防绕过模块已停止")

@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+pip-wheel-metadata/
+share/python-wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# PyInstaller
+*.spec
+build/
+dist/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Secrets / Keys (切勿提交密钥与凭据)
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+secrets.yaml
+secrets.json
+.guardian_key
+
+# Build artifacts
+*.exe
+*.dll
+*.pdb
+
+# Local config overrides
+config/config.local.yaml
+config/local.yaml

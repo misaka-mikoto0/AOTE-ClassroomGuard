@@ -1,0 +1,112 @@
+# config.yaml - AOTE 管控系统配置文件
+
+# 时间调度配置
+schedule:
+  weekday:
+    1: [["08:00", "12:00"], ["14:00", "17:30"]]   # 周一
+    2: [["08:00", "12:00"], ["14:00", "17:30"]]   # 周二
+    3: [["08:00", "12:00"], ["14:00", "17:30"]]   # 周三
+    4: [["08:00", "12:00"], ["14:00", "17:30"]]   # 周四
+    5: [["08:00", "12:00"], ["14:00", "17:30"]]   # 周五
+    6: []                                          # 周六
+    7: []                                          # 周日
+  exceptions:
+    "2026-09-10": "holiday"    # 教师节放假
+    "2026-10-08": "classday"   # 调休上课
+
+# 目标进程名单（需要冻结的进程）
+target_processes:
+  browsers:
+    - "chrome.exe"
+    - "msedge.exe"
+    - "firefox.exe"
+    - "brave.exe"
+    - "opera.exe"
+    - "vivaldi.exe"
+    - "qqbrowser.exe"
+    - "360chrome.exe"
+  video:
+    - "vlc.exe"
+    - "potplayer.exe"
+    - "mpc-hc.exe"
+    - "mpv.exe"
+    - "bilibili.exe"
+    - "youku.exe"
+    - "iqiyi.exe"
+    - "qqplayer.exe"
+  games:
+    - "steam.exe"
+    - "epicgameslauncher.exe"
+    - "wegame.exe"
+  # 数学题期间额外冻结的进程（计算器、浏览器等）
+  math_lockdown:
+    - "calc.exe"
+    - "calculator.exe"
+    - "calc1.exe"
+    - "win32calc.exe"
+    - "chrome.exe"
+    - "msedge.exe"
+    - "firefox.exe"
+    - "brave.exe"
+    - "opera.exe"
+    - "vivaldi.exe"
+    - "qqbrowser.exe"
+    - "360chrome.exe"
+    - "mathway.exe"
+    - "photomath.exe"
+    - "wolframalpha.exe"
+    - "symbolab.exe"
+
+# 数学挑战配置
+math_challenge:
+  level_1_reward_seconds: 300   # 难度一：5分钟
+  level_2_reward_seconds: 600   # 难度二：10分钟
+  # 题目参数：四位数运算，结果必须是10位数
+  question_params:
+    min_number: 1000
+    max_number: 9999
+    result_min: 1000000000
+    result_max: 9999999999
+    operations: ["+", "-", "*", "/"]
+
+# U盘授权配置
+usb_guard:
+  whitelist_serials:
+    - "A1B2C3D4E5F6"
+    - "G7H8I9J0K1L2"
+  key_filename: ".guardian_key"
+  # SHA-256 hash of "AOTE-Admin-Key-2026" (需要管理员修改)
+  key_hash_sha256: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+
+# 解锁模式
+unlock_modes:
+  - { name: "即拔即禁", type: "eject" }
+  - { name: "30分钟", type: "timer", seconds: 1800 }
+  - { name: "1小时", type: "timer", seconds: 3600 }
+  - { name: "2小时", type: "timer", seconds: 7200 }
+
+# 紧急/管理员配置
+emergency:
+  hotkey: "ctrl+shift+alt+g"
+  # SHA-256 hash of "Admin@123" (需要管理员修改)
+  admin_password_hash: "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+
+# 日志配置
+logging:
+  path: "C:\\ProgramData\\ClassroomGuard\\logs"
+  retention_days: 30
+
+# HTTP服务配置（浏览器扩展通信）
+http_server:
+  host: "127.0.0.1"
+  port: 8765
+  extension_heartbeat_timeout: 30  # 秒
+
+# 双进程守护
+watchdog:
+  monitor_interval: 2  # 秒，检查对端是否存活
+  restart_delay: 1     # 秒，重启延迟
+
+# 进程扫描间隔
+process_hunter:
+  scan_interval: 0.5   # 秒
