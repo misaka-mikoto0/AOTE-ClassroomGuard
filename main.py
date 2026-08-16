@@ -47,19 +47,55 @@ def is_admin() -> bool:
 
 
 def require_admin():
-    """如果不是管理员，UAC提升重启"""
+    """如果不是管理员，UAC提升重启（使用pythonw.exe避免控制台窗口）"""
     if is_admin():
         return
     try:
         import ctypes
+        # 优先使用 pythonw.exe（无控制台窗口）
+        exe = sys.executable
+        pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(pythonw):
+            exe = pythonw
         params = " ".join([f'"{a}"' for a in sys.argv])
         ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, params, None, 1
+            None, "runas", exe, params, None, 0  # SW_HIDE=0 隐藏窗口
         )
         sys.exit(0)
     except Exception as e:
-        print(f"[错误] 本系统必须以管理员权限运行: {e}")
         sys.exit(1)
+
+
+def hide_console():
+    """隐藏当前控制台窗口（如果存在）"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+    except Exception:
+        pass
+
+
+def acquire_process_lock(lock_name: str) -> bool:
+    """尝试获取命名互斥量锁，确保单实例运行
+    :return: True=获取成功(首次启动)，False=已有实例在运行
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, lock_name)
+        # ERROR_ALREADY_EXISTS = 183
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            ctypes.windll.kernel32.CloseHandle(mutex)
+            return False
+        # 保持 mutex 句柄不关闭，进程退出时自动释放
+        return True
+    except Exception:
+        return True  # API异常时放行，不阻塞启动
 
 
 # ======================================================
@@ -244,17 +280,36 @@ class GuardianApp:
 
     # ============ 托盘/热键 退出 ============
     def _tray_emergency_exit(self):
-        """通过托盘/热键触发紧急退出"""
-        if self.anti_tamper and self.anti_tamper.show_emergency_exit_dialog():
-            self.logger.log_admin_action("emergency_exit", True)
-            self._emergency_exit()
+        """通过托盘/热键触发紧急退出或临时解锁"""
+        if self.anti_tamper:
+            should_exit, unlock_seconds = self.anti_tamper.show_emergency_exit_dialog()
+            if should_exit:
+                self.logger.log_admin_action("emergency_exit", True)
+                self._emergency_exit()
+            elif unlock_seconds > 0:
+                self.logger.log_admin_action("temporary_unlock", True)
+                self.process_hunter.temporary_unlock(unlock_seconds)
 
     def _emergency_exit(self):
-        """实际执行退出操作"""
+        """实际执行退出操作：卸载自启动 → 停止防绕过 → 杀watchdog → 强制退出"""
         self.logger.warning("⚠ 执行系统紧急退出")
-        # 停止 watchdog
+        # 1. 卸载所有自启动机制（计划任务 + 注册表）
+        try:
+            if self.anti_tamper:
+                self.anti_tamper.uninstall_autostart()
+        except Exception:
+            pass
+        # 2. 停止防绕过模块（防止监控循环复活对端）
+        try:
+            if self.anti_tamper:
+                self.anti_tamper.stop()
+        except Exception:
+            pass
+        # 3. 杀掉 watchdog 子进程
         self._kill_watchdog()
-        self._shutdown.set()
+        # 4. 强制退出（不等主循环，防止被拦截/复活）
+        self.logger.info("👋 系统已完全退出")
+        os._exit(0)
 
     def _on_force_killed(self):
         """对方进程被杀并复活的回调"""
@@ -272,9 +327,9 @@ class GuardianApp:
                 target = sys.executable
                 args = [target, script, "--watchdog"]
 
-            DETACHED_PROCESS = 0x00000008 if sys.platform == "win32" else 0
+            CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
             CREATE_NEW_PROCESS_GROUP = 0x00000200 if sys.platform == "win32" else 0
-            flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
             proc = subprocess.Popen(
                 args, creationflags=flags, close_fds=True
@@ -410,9 +465,9 @@ def _respawn_main(logger) -> Optional[int]:
         else:
             target = sys.executable
             args = [target, script, "--main"]
-        DETACHED_PROCESS = 0x00000008 if sys.platform == "win32" else 0
+        CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
         CREATE_NEW_PROCESS_GROUP = 0x00000200 if sys.platform == "win32" else 0
-        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(args, creationflags=flags, close_fds=True)
         logger.info(f"[Watchdog] 主进程复活成功，新PID={proc.pid}")
         return proc.pid
@@ -446,8 +501,8 @@ def run_respawn_check():
         else:
             target = sys.executable
             args = [target, script, "--daemon"]
-        DETACHED_PROCESS = 0x00000008 if sys.platform == "win32" else 0
-        subprocess.Popen(args, creationflags=DETACHED_PROCESS, close_fds=True)
+        CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+        subprocess.Popen(args, creationflags=CREATE_NO_WINDOW, close_fds=True)
     else:
         print(f"[Respawn] 主进程={main_found}, 守护进程={watchdog_found}，无需复活")
 
@@ -470,6 +525,12 @@ def main():
 
     # 其他模式强制管理员权限
     require_admin()
+    hide_console()  # 隐藏控制台窗口
+
+    # 进程锁：确保同一模式只有一个实例运行
+    lock_name = "AOTE_Watchdog_Lock" if args.watchdog else "AOTE_Main_Lock"
+    if not acquire_process_lock(lock_name):
+        sys.exit(0)  # 已有实例在运行，静默退出
 
     if args.watchdog:
         run_watchdog()

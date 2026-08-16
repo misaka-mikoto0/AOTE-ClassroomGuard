@@ -230,10 +230,16 @@ class MathChallengeWindow:
         self._success = False
 
         self.root: Optional[tk.Tk] = None
-        self.question_label: Optional[ttk.Label] = None
-        self.answer_entry: Optional[ttk.Entry] = None
-        self.status_label: Optional[ttk.Label] = None
+        self.question_label: Optional[tk.Label] = None
+        self.answer_entry: Optional[tk.Entry] = None
+        self.status_label: Optional[tk.Label] = None
         self.level_var: Optional[tk.IntVar] = None
+
+        # 倒计时相关
+        self._countdown_seconds: int = 120
+        self._countdown_label: Optional[tk.Label] = None
+        self._level_info_label: Optional[tk.Label] = None
+        self._countdown_job = None
 
         # 线程相关
         self._thread: Optional[threading.Thread] = None
@@ -255,11 +261,18 @@ class MathChallengeWindow:
         """生成新题目"""
         self.current_question = self.generator.generate_question(level)
         self.question_start_time = time.time()
-        self.question_label.config(
-            text=f"题目 (难度{level}):\n\n{self.current_question.text}",
-        )
+        self.question_label.config(text=self.current_question.text)
         self.answer_entry.delete(0, tk.END)
-        self.status_label.config(text="请输入你的答案（10位整数）", foreground="#1a1a1a")
+        self.status_label.config(text="请输入你的答案（10位整数）", foreground="#595959")
+        # 重置倒计时
+        self._countdown_seconds = int(self.config.get("math_challenge.question_timeout", 120))
+        self._update_countdown_display()
+        # 更新难度信息
+        if self._level_info_label:
+            self._level_info_label.config(
+                text=f"当前难度: {'⭐ 基础' if self.current_question.level == 1 else '⭐⭐ 进阶'}   "
+                     f"解锁时长: {self.current_question.unlock_seconds // 60} 分钟"
+            )
 
     def _check_answer(self):
         """检查用户答案"""
@@ -293,6 +306,7 @@ class MathChallengeWindow:
         )
 
         if is_correct:
+            self._cancel_countdown()
             self._success = True
             unlock = self.current_question.unlock_seconds
             self.status_label.config(text=f"✓ 回答正确！系统将在 {unlock//60} 分钟内保持解锁", foreground="green")
@@ -315,167 +329,255 @@ class MathChallengeWindow:
 
     # ============ 窗口构建 ============
     def _build_window(self, level: int = 1):
-        """构建tkinter窗口"""
+        """构建tkinter窗口 - 现代化UI"""
         self.root = tk.Tk()
         self.root.title("实力主义至上一体机 - 数学挑战")
 
-        # 窗口设置：置顶、居中、大尺寸
-        w, h = 720, 520
+        # 窗口设置：非最大化，居中
+        w, h = 860, 620
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = (sw - w) // 2
         y = (sh - h) // 2
         self.root.geometry(f"{w}x{h}+{x}+{y}")
-        self.root.minsize(600, 400)
-        self.root.attributes("-topmost", True)  # 置顶
-        try:
-            self.root.state("zoomed")  # Windows 最大化
-        except tk.TclError:
-            pass
-        self.root.configure(bg="#004d8c")
+        self.root.minsize(700, 500)
+        self.root.resizable(True, True)
+        self.root.attributes("-topmost", True)
+        self.root.configure(bg="#f0f2f5")
 
         # 禁用关闭按钮
-        def _dummy_close():
-            pass
-        self.root.protocol("WM_DELETE_WINDOW", _dummy_close)
+        self.root.protocol("WM_DELETE_WINDOW", lambda: None)
 
-        # 全局快捷键：禁用 Alt+F4, Win 等
+        # 键盘绑定：禁用 Alt+F4 / Escape，Enter 提交
         def _on_key(event):
-            # 防止 Alt+F4
             if event.keysym == "F4" and (event.state & 0x20000):
                 return "break"
-            # 防止 Escape 关闭
             if event.keysym == "Escape":
                 return "break"
-            # 提交答案 Enter
             if event.keysym == "Return":
                 self._check_answer()
                 return "break"
         self.root.bind_all("<Key>", _on_key)
 
-        # 样式
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        # 大字体
-        BIG_FONT = ("Microsoft YaHei", 28, "bold")
-        NORMAL_FONT = ("Microsoft YaHei", 14)
+        # 字体定义
+        TITLE_FONT = ("Microsoft YaHei", 20, "bold")
+        QUESTION_FONT = ("Consolas", 32, "bold")
+        TIMER_FONT = ("Consolas", 22, "bold")
+        NORMAL_FONT = ("Microsoft YaHei", 13)
         BTN_FONT = ("Microsoft YaHei", 12, "bold")
+        SMALL_FONT = ("Microsoft YaHei", 10)
 
-        # 顶部标题
-        header = tk.Frame(self.root, bg="#003366", height=70)
+        # === 顶部标题栏（含倒计时） ===
+        header = tk.Frame(self.root, bg="#1a73e8", height=60)
         header.pack(fill=tk.X, side=tk.TOP)
-        title_label = tk.Label(
+        header.pack_propagate(False)
+
+        tk.Label(
             header, text="🎓 数学挑战解锁系统",
-            font=("Microsoft YaHei", 22, "bold"),
-            fg="white", bg="#003366"
+            font=TITLE_FONT, fg="white", bg="#1a73e8"
+        ).pack(side=tk.LEFT, padx=20)
+
+        self._countdown_label = tk.Label(
+            header, text="⏱ 02:00",
+            font=TIMER_FONT, fg="#ffec3d", bg="#1a73e8"
         )
-        title_label.pack(pady=15)
+        self._countdown_label.pack(side=tk.RIGHT, padx=20)
 
-        # 主体内容框
-        main = tk.Frame(self.root, bg="white", padx=40, pady=30)
-        main.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        # === 欢迎语 ===
+        tk.Label(
+            self.root,
+            text="欢迎使用实力至上的一体机(All-in-One of the Elite)，如果你想用浏览器，那就向我证明你的实力吧",
+            font=("Microsoft YaHei", 11),
+            fg="#1a73e8", bg="#e8f0fe",
+            pady=8
+        ).pack(fill=tk.X, side=tk.TOP)
 
-        # 难度选择（第一次选择）
+        # === 主体内容 ===
+        main = tk.Frame(self.root, bg="#f0f2f5", padx=30, pady=20)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # 生成题目
         self.level_var = tk.IntVar(value=level)
         if not self.current_question:
-            self._new_question(level)
+            self.current_question = self.generator.generate_question(level)
+            self.question_start_time = time.time()
 
         # 难度信息栏
-        level_frame = tk.Frame(main, bg="white")
-        level_frame.pack(fill=tk.X, pady=(0, 20))
-        tk.Label(
-            level_frame,
+        info_frame = tk.Frame(main, bg="#f0f2f5")
+        info_frame.pack(fill=tk.X, pady=(0, 15))
+
+        self._level_info_label = tk.Label(
+            info_frame,
             text=f"当前难度: {'⭐ 基础' if self.current_question.level == 1 else '⭐⭐ 进阶'}   "
                  f"解锁时长: {self.current_question.unlock_seconds // 60} 分钟",
-            font=("Microsoft YaHei", 12),
-            fg="#555", bg="white"
-        ).pack(side=tk.LEFT)
-
-        # 切换难度按钮
-        switch_frame = tk.Frame(level_frame, bg="white")
-        switch_frame.pack(side=tk.RIGHT)
-        ttk.Button(
-            switch_frame, text="换难度一(5分钟)",
-            command=lambda: self._new_question(1),
-            style="Accent.TButton"
-        ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(
-            switch_frame, text="换难度二(10分钟)",
-            command=lambda: self._new_question(2),
-            style="Accent.TButton"
-        ).pack(side=tk.LEFT, padx=4)
-
-        # 题目显示
-        q_frame = tk.Frame(main, bg="#f0f7ff", padx=20, pady=30, relief=tk.RIDGE, bd=2)
-        q_frame.pack(fill=tk.X, pady=10)
-        self.question_label = tk.Label(
-            q_frame,
-            text=f"题目:\n\n{self.current_question.text}",
-            font=BIG_FONT,
-            fg="#001f3f",
-            bg="#f0f7ff",
-            justify=tk.CENTER,
-            wraplength=600
+            font=NORMAL_FONT, fg="#595959", bg="#f0f2f5"
         )
-        self.question_label.pack()
+        self._level_info_label.pack(side=tk.LEFT)
 
-        # 输入框
-        input_frame = tk.Frame(main, bg="white")
-        input_frame.pack(fill=tk.X, pady=25)
-        tk.Label(input_frame, text="答案: ", font=NORMAL_FONT, bg="white").pack(side=tk.LEFT)
-        self.answer_entry = ttk.Entry(
-            input_frame,
-            font=("Consolas", 20, "bold"),
-            width=18,
+        # 难度切换按钮
+        switch_frame = tk.Frame(info_frame, bg="#f0f2f5")
+        switch_frame.pack(side=tk.RIGHT)
+        tk.Button(
+            switch_frame, text="难度一(5分钟)",
+            font=SMALL_FONT, bg="#e8f0fe", fg="#1a73e8",
+            relief=tk.FLAT, padx=10, pady=4, cursor="hand2",
+            command=lambda: self._new_question(1)
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Button(
+            switch_frame, text="难度二(10分钟)",
+            font=SMALL_FONT, bg="#e8f0fe", fg="#1a73e8",
+            relief=tk.FLAT, padx=10, pady=4, cursor="hand2",
+            command=lambda: self._new_question(2)
+        ).pack(side=tk.LEFT, padx=4)
+
+        # === 题目卡片 ===
+        q_card = tk.Frame(
+            main, bg="white",
+            highlightbackground="#d9d9d9", highlightthickness=1
+        )
+        q_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+
+        self.question_label = tk.Label(
+            q_card,
+            text=self.current_question.text,
+            font=QUESTION_FONT,
+            fg="#1a1a1a", bg="white",
             justify=tk.CENTER
         )
-        self.answer_entry.pack(side=tk.LEFT, padx=10, ipady=8)
+        self.question_label.pack(expand=True)
+
+        # === 答案输入区 ===
+        input_frame = tk.Frame(main, bg="#f0f2f5")
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(
+            input_frame, text="答案:", font=NORMAL_FONT,
+            bg="#f0f2f5", fg="#595959"
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.answer_entry = tk.Entry(
+            input_frame,
+            font=("Consolas", 22, "bold"),
+            width=20, justify=tk.CENTER,
+            relief=tk.FLAT, bg="white", fg="#1a1a1a",
+            highlightbackground="#1a73e8", highlightthickness=2
+        )
+        self.answer_entry.pack(side=tk.LEFT, padx=5, ipady=10)
         self.answer_entry.focus_set()
 
-        # 提交按钮
-        submit_btn = tk.Button(
-            input_frame, text="提交答案 (Enter)",
-            font=BTN_FONT,
-            bg="#0078d7", fg="white",
-            activebackground="#005a9e", activeforeground="white",
-            relief=tk.FLAT, padx=20, pady=10,
-            cursor="hand2",
+        tk.Button(
+            input_frame, text="✓ 提交答案 (Enter)",
+            font=BTN_FONT, bg="#1a73e8", fg="white",
+            activebackground="#1557b0", activeforeground="white",
+            relief=tk.FLAT, padx=20, pady=10, cursor="hand2",
             command=self._check_answer
-        )
-        submit_btn.pack(side=tk.LEFT, padx=10)
+        ).pack(side=tk.LEFT, padx=10)
 
-        # 换一题按钮
-        new_btn = tk.Button(
-            input_frame, text="换一题",
-            font=BTN_FONT,
-            bg="#e1e1e1", fg="#333",
-            relief=tk.FLAT, padx=15, pady=10,
-            cursor="hand2",
+        tk.Button(
+            input_frame, text="🔄 换一题",
+            font=BTN_FONT, bg="#ffffff", fg="#595959",
+            relief=tk.FLAT, padx=15, pady=10, cursor="hand2",
+            highlightbackground="#d9d9d9", highlightthickness=1,
             command=lambda: self._new_question(self.current_question.level)
-        )
-        new_btn.pack(side=tk.LEFT, padx=5)
+        ).pack(side=tk.LEFT, padx=5)
 
-        # 状态提示
+        # === 状态提示 ===
         self.status_label = tk.Label(
             main, text="请输入你的答案（10位整数）",
-            font=("Microsoft YaHei", 12, "bold"),
-            fg="#1a1a1a", bg="white"
+            font=("Microsoft YaHei", 12), fg="#595959", bg="#f0f2f5"
         )
-        self.status_label.pack(pady=10)
+        self.status_label.pack(pady=(5, 10))
 
-        # 底部提示
-        footer = tk.Frame(self.root, bg="#004d8c", height=50)
-        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        # === 底部操作栏（含退出按钮） ===
+        bottom = tk.Frame(self.root, bg="#ffffff", height=55)
+        bottom.pack(fill=tk.X, side=tk.BOTTOM)
+        bottom.pack_propagate(False)
+
         tk.Label(
-            footer,
-            text="💡 提示：答案必须为整数（可正可负）。答对即可获得临时解锁权限。做题期间计算器和浏览器已禁用。",
-            font=("Microsoft YaHei", 10),
-            fg="#cce4ff", bg="#004d8c"
-        ).pack(pady=12)
+            bottom, text="💡 做题期间计算器和浏览器已禁用",
+            font=SMALL_FONT, fg="#8c8c8c", bg="#ffffff"
+        ).pack(side=tk.LEFT, padx=20)
+
+        tk.Button(
+            bottom, text="🚪 退出并关闭浏览器",
+            font=BTN_FONT, bg="#ff4d4f", fg="white",
+            activebackground="#cf1322", activeforeground="white",
+            relief=tk.FLAT, padx=20, pady=8, cursor="hand2",
+            command=self._on_exit_clicked
+        ).pack(side=tk.RIGHT, padx=20)
+
+        # 启动倒计时
+        self._start_countdown()
+
+    # ============ 倒计时 ============
+    def _start_countdown(self):
+        """启动倒计时"""
+        self._countdown_seconds = int(self.config.get("math_challenge.question_timeout", 120))
+        self._update_countdown_display()
+        self._tick_countdown()
+
+    def _tick_countdown(self):
+        """每秒更新倒计时"""
+        if not self.root:
+            return
+        self._countdown_seconds -= 1
+        if self._countdown_seconds <= 0:
+            self._new_question(self.current_question.level)
+            self.status_label.config(text="⏰ 时间到！已自动切换下一题", foreground="#ff4d4f")
+        self._update_countdown_display()
+        try:
+            self._countdown_job = self.root.after(1000, self._tick_countdown)
+        except Exception:
+            pass
+
+    def _update_countdown_display(self):
+        """更新倒计时显示"""
+        if not self._countdown_label:
+            return
+        m = self._countdown_seconds // 60
+        s = self._countdown_seconds % 60
+        text = f"⏱ {m:02d}:{s:02d}"
+        color = "#ff4d4f" if self._countdown_seconds <= 10 else "#ffec3d"
+        try:
+            self._countdown_label.config(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _cancel_countdown(self):
+        """取消倒计时"""
+        if self._countdown_job:
+            try:
+                self.root.after_cancel(self._countdown_job)
+            except Exception:
+                pass
+            self._countdown_job = None
+
+    # ============ 退出按钮 ============
+    def _on_exit_clicked(self):
+        """退出按钮：关闭浏览器进程并关闭答题窗口"""
+        self.logger.info("[MathChallenge] 用户点击退出按钮，关闭浏览器并退出")
+        self._cancel_countdown()
+        self._kill_browser_processes()
+        self._success = False
+        try:
+            if self.root:
+                self.root.destroy()
+        except Exception:
+            pass
+
+    def _kill_browser_processes(self):
+        """终止所有浏览器进程"""
+        import psutil
+        browsers = set(b.lower() for b in self.config.get("target_processes.browsers", []))
+        killed = 0
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                if p.name().lower() in browsers:
+                    p.terminate()
+                    killed += 1
+            except Exception:
+                pass
+        self.logger.info(f"[MathChallenge] 退出时终止了 {killed} 个浏览器进程")
 
     # ============ 显示/等待 ============
     def show_and_wait(self, level: int = 1) -> bool:
@@ -496,6 +598,12 @@ class MathChallengeWindow:
             except Exception as e:
                 self.logger.error(f"数学挑战窗口异常: {e}")
             finally:
+                try:
+                    if self.root:
+                        self.root.destroy()
+                except Exception:
+                    pass
+                self.root = None
                 self._exit_math_lockdown()
                 if not self._success:
                     self._result_event.set()

@@ -142,7 +142,7 @@ class SystemTray:
 
         # 构建菜单
         menu = Menu(
-            Item(lambda text, item: f"📊 系统状态 {_get_status()}", self._menu_status),
+            Item(lambda icon: f"📊 系统状态 {_get_status()}", self._menu_status),
             Menu.SEPARATOR,
             Item("🔒 切回严格模式", self._menu_strict_mode),
             Item("🔓 切到宽松模式(调试)", self._menu_relaxed_mode),

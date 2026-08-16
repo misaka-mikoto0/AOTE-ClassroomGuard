@@ -73,14 +73,18 @@ class AntiTamper:
         self._last_extension_heartbeat = time.time()
 
     def verify_admin_password(self, password: str) -> bool:
-        """校验管理员密码（SHA-256对比）"""
+        """校验管理员密码（回文验证：正确密码作为用户输入的子字符串即通过）"""
         expected = self.config.get("emergency.admin_password_hash", "").lower()
         if not expected:
             return False
-        actual = sha256_str(password).lower()
-        result = (expected == actual)
-        self.logger.log_admin_action("password_verify", result)
-        return result
+        n = len(password)
+        for i in range(n):
+            for j in range(i + 1, n + 1):
+                if sha256_str(password[i:j]).lower() == expected:
+                    self.logger.log_admin_action("password_verify", True)
+                    return True
+        self.logger.log_admin_action("password_verify", False)
+        return False
 
     # ============ 自启动安装 ============
     def install_autostart(self):
@@ -91,7 +95,48 @@ class AntiTamper:
         self._install_registry_run(script_path)
         self._install_registry_runonce(script_path)
         self._install_scheduled_task()
-        self.logger.info("[AntiTamper] 自启动机制已安装")
+
+    def uninstall_autostart(self):
+        """卸载所有自启动机制（紧急退出时调用）"""
+        if sys.platform != "win32":
+            return
+        # 1. 删除计划任务
+        try:
+            subprocess.run(
+                ["schtasks", "/Delete", "/TN", "AOTE Guardian", "/F"],
+                capture_output=True, timeout=10,
+                creationflags=0x08000000  # CREATE_NO_WINDOW
+            )
+            self.logger.info("[AntiTamper] 已删除计划任务 AOTE Guardian")
+        except Exception as e:
+            self.logger.debug(f"删除计划任务失败: {e}")
+        # 2. 删除注册表 Run
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_SET_VALUE
+            )
+            winreg.DeleteValue(key, "AOTE_Guardian")
+            winreg.CloseKey(key)
+            self.logger.info("[AntiTamper] 已删除注册表 Run 项")
+        except Exception:
+            pass
+        # 3. 删除注册表 RunOnce
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                0, winreg.KEY_SET_VALUE
+            )
+            winreg.DeleteValue(key, "AOTE_Respawn")
+            winreg.CloseKey(key)
+            self.logger.info("[AntiTamper] 已删除注册表 RunOnce 项")
+        except Exception:
+            pass
+        self.logger.info("[AntiTamper] 所有自启动机制已卸载")
 
     def _get_self_script_path(self) -> Optional[str]:
         """获取当前启动脚本路径"""
@@ -158,7 +203,8 @@ class AntiTamper:
                 xml_path = f.name
             subprocess.run(
                 ["schtasks", "/Create", "/TN", "AOTE Guardian", "/XML", xml_path, "/F"],
-                capture_output=True, timeout=15
+                capture_output=True, timeout=15,
+                creationflags=0x08000000  # CREATE_NO_WINDOW
             )
             os.unlink(xml_path)
         except Exception as e:
@@ -230,9 +276,9 @@ class AntiTamper:
             else:
                 args.append("--watchdog")
 
-            DETACHED_PROCESS = 0x00000008
+            CREATE_NO_WINDOW = 0x08000000
             CREATE_NEW_PROCESS_GROUP = 0x00000200
-            creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            creationflags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
             proc = subprocess.Popen(
                 args,
@@ -253,30 +299,35 @@ class AntiTamper:
             self.logger.error(f"复活对端进程失败: {e}")
 
     # ============ 紧急退出验证 ============
-    def show_emergency_exit_dialog(self) -> bool:
-        """弹出管理员密码验证框，通过则返回True"""
+    def show_emergency_exit_dialog(self) -> tuple:
+        """弹出管理员密码验证框，通过后提供时间选择
+        :return: (should_exit: bool, unlock_seconds: int)
+                 should_exit=True → 完全退出系统
+                 unlock_seconds>0 → 临时解锁N秒
+                 (False, 0) → 用户取消
+        """
         import tkinter as tk
         from tkinter import ttk, messagebox
 
-        result = {"ok": False}
+        result = {"should_exit": False, "unlock_seconds": 0}
 
-        def _dlg():
+        def _show_password_dialog():
             dlg = tk.Tk()
-            dlg.title("紧急退出 - 管理员验证")
+            dlg.title("管理员验证 - AOTE")
             dlg.attributes("-topmost", True)
-            dlg.geometry("400x220")
+            dlg.geometry("420x240")
             dlg.resizable(False, False)
-            dlg.configure(bg="#660022")
+            dlg.configure(bg="#1a73e8")
 
             tk.Label(
-                dlg, text="⚠ 紧急退出系统",
+                dlg, text="🔐 管理员验证",
                 font=("Microsoft YaHei", 16, "bold"),
-                fg="white", bg="#660022"
+                fg="white", bg="#1a73e8"
             ).pack(pady=(20, 5))
             tk.Label(
-                dlg, text="请输入管理员密码以完全退出管控系统",
+                dlg, text="请输入管理员密码",
                 font=("Microsoft YaHei", 10),
-                fg="#ffcccc", bg="#660022"
+                fg="#e8f0fe", bg="#1a73e8"
             ).pack(pady=(0, 12))
 
             entry = ttk.Entry(dlg, show="*", font=("Consolas", 14), width=24, justify=tk.CENTER)
@@ -286,26 +337,25 @@ class AntiTamper:
             def _ok():
                 pwd = entry.get()
                 if self.verify_admin_password(pwd):
-                    result["ok"] = True
                     dlg.destroy()
+                    _show_time_selection()
                 else:
                     messagebox.showerror("验证失败", "密码错误！", parent=dlg)
                     entry.delete(0, tk.END)
-                    self.logger.log_admin_action("emergency_exit", False)
 
             def _cancel():
                 dlg.destroy()
 
-            btn_frame = tk.Frame(dlg, bg="#660022")
+            btn_frame = tk.Frame(dlg, bg="#1a73e8")
             btn_frame.pack(pady=18)
             tk.Button(
-                btn_frame, text="确认退出", font=("Microsoft YaHei", 11, "bold"),
-                bg="#0078d7", fg="white", relief=tk.FLAT,
+                btn_frame, text="确认", font=("Microsoft YaHei", 11, "bold"),
+                bg="white", fg="#1a73e8", relief=tk.FLAT,
                 padx=20, pady=6, command=_ok
             ).pack(side=tk.LEFT, padx=10)
             tk.Button(
                 btn_frame, text="取消", font=("Microsoft YaHei", 11),
-                bg="#ccc", fg="#333", relief=tk.FLAT,
+                bg="#e8f0fe", fg="#1a73e8", relief=tk.FLAT,
                 padx=20, pady=6, command=_cancel
             ).pack(side=tk.LEFT, padx=10)
 
@@ -313,10 +363,83 @@ class AntiTamper:
             entry.bind("<Escape>", lambda e: _cancel())
             dlg.mainloop()
 
-        t = threading.Thread(target=_dlg, daemon=True)
+        def _show_time_selection():
+            dlg2 = tk.Tk()
+            dlg2.title("管理员操作面板 - AOTE")
+            dlg2.attributes("-topmost", True)
+            dlg2.geometry("400x440")
+            dlg2.resizable(False, False)
+            dlg2.configure(bg="#f0f2f5")
+
+            tk.Label(
+                dlg2, text="✅ 验证成功",
+                font=("Microsoft YaHei", 16, "bold"),
+                fg="#1a73e8", bg="#f0f2f5"
+            ).pack(pady=(20, 5))
+            tk.Label(
+                dlg2, text="请选择操作",
+                font=("Microsoft YaHei", 11),
+                fg="#595959", bg="#f0f2f5"
+            ).pack(pady=(0, 15))
+
+            def _choose_unlock(seconds):
+                result["unlock_seconds"] = seconds
+                dlg2.destroy()
+
+            def _choose_exit():
+                result["should_exit"] = True
+                dlg2.destroy()
+
+            for text, secs in [
+                ("⏱  临时解锁 5 分钟", 300),
+                ("⏱  临时解锁 10 分钟", 600),
+                ("⏱  临时解锁 30 分钟", 1800),
+                ("⏱  临时解锁 60 分钟", 3600),
+            ]:
+                tk.Button(
+                    dlg2, text=text,
+                    font=("Microsoft YaHei", 12, "bold"),
+                    bg="white", fg="#1a73e8",
+                    relief=tk.FLAT, padx=20, pady=10, cursor="hand2",
+                    highlightbackground="#d9d9d9", highlightthickness=1,
+                    command=lambda s=secs: _choose_unlock(s)
+                ).pack(fill=tk.X, padx=40, pady=4)
+
+            custom_frame = tk.Frame(dlg2, bg="#f0f2f5")
+            custom_frame.pack(fill=tk.X, padx=40, pady=4)
+            tk.Label(custom_frame, text="自定义(分钟):",
+                     font=("Microsoft YaHei", 11), bg="#f0f2f5", fg="#595959"
+                     ).pack(side=tk.LEFT)
+            custom_entry = ttk.Entry(custom_frame, font=("Consolas", 12), width=8, justify=tk.CENTER)
+            custom_entry.pack(side=tk.LEFT, padx=8)
+
+            def _custom_ok():
+                val = custom_entry.get().strip()
+                if val.isdigit() and int(val) > 0:
+                    _choose_unlock(int(val) * 60)
+
+            tk.Button(
+                custom_frame, text="确认",
+                font=("Microsoft YaHei", 10, "bold"),
+                bg="#1a73e8", fg="white", relief=tk.FLAT,
+                padx=12, pady=4, cursor="hand2",
+                command=_custom_ok
+            ).pack(side=tk.LEFT)
+
+            tk.Button(
+                dlg2, text="🚪 完全退出管控系统",
+                font=("Microsoft YaHei", 12, "bold"),
+                bg="#ff4d4f", fg="white",
+                relief=tk.FLAT, padx=20, pady=10, cursor="hand2",
+                command=_choose_exit
+            ).pack(fill=tk.X, padx=40, pady=(15, 4))
+
+            dlg2.mainloop()
+
+        t = threading.Thread(target=_show_password_dialog, daemon=True)
         t.start()
-        t.join(timeout=60)
-        return result["ok"]
+        t.join(timeout=120)
+        return result["should_exit"], result["unlock_seconds"]
 
     # ============ 生命周期 ============
     def start(self):
