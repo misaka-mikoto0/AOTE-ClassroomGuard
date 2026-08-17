@@ -73,33 +73,33 @@ class SystemTray:
                 return None
 
     # ============ 菜单动作 ============
-    def _menu_strict_mode(self, icon, item):
+    def _menu_strict_mode(self, *args):
         """切换到严格模式"""
         if hasattr(self.time_guard, "_emergency_forced"):
             self.time_guard._emergency_forced = False
         self.time_guard._set_mode(TimeGuard.MODE_STRICT, "tray_strict")
         self.process_hunter.restore_strict_mode()
 
-    def _menu_relaxed_mode(self, icon, item):
+    def _menu_relaxed_mode(self, *args):
         """切换到宽松模式（调试用）"""
         if hasattr(self.time_guard, "_emergency_forced"):
             self.time_guard._emergency_forced = False
         self.time_guard._set_mode(TimeGuard.MODE_RELAXED, "tray_relaxed")
 
-    def _menu_temp_unlock_5min(self, icon, item):
+    def _menu_temp_unlock_5min(self, *args):
         """临时解锁5分钟"""
         self.process_hunter.temporary_unlock(300)
 
-    def _menu_temp_unlock_30min(self, icon, item):
+    def _menu_temp_unlock_30min(self, *args):
         """临时解锁30分钟"""
         self.process_hunter.temporary_unlock(1800)
 
-    def _menu_math_challenge(self, icon, item):
+    def _menu_math_challenge(self, *args):
         """显示数学挑战"""
         if self.on_show_math_challenge:
             threading.Thread(target=self.on_show_math_challenge, daemon=True).start()
 
-    def _menu_status(self, icon, item):
+    def _menu_status(self, *args):
         """显示当前状态（弹消息）"""
         mode_cn = {
             TimeGuard.MODE_STRICT: "严格模式（冻结目标）",
@@ -122,7 +122,7 @@ class SystemTray:
         except Exception:
             pass
 
-    def _menu_emergency_exit(self, icon, item):
+    def _menu_emergency_exit(self, *args):
         """紧急退出（触发密码验证）"""
         if self.on_emergency_exit_request:
             threading.Thread(target=self.on_emergency_exit_request, daemon=True).start()
@@ -142,8 +142,8 @@ class SystemTray:
             return
 
         def _checked(prefix):
-            """返回带状态前缀的菜单文本（pystray 菜单文本函数签名必须是 (icon, item)）"""
-            return lambda icon, item: f"{prefix} {_get_status()}"
+            """返回带状态前缀的菜单文本（兼容多版本 pystray：(icon,item) / (item,) / 无参）"""
+            return lambda *a: f"{prefix} {_get_status()}"
 
         def _get_status():
             mode_short = {
@@ -157,7 +157,7 @@ class SystemTray:
 
         # 构建菜单
         menu = Menu(
-            Item(lambda icon, item: f"📊 系统状态 {_get_status()}", self._menu_status),
+            Item(lambda *a: f"📊 系统状态 {_get_status()}", self._menu_status),
             Menu.SEPARATOR,
             Item("🔒 切回严格模式", self._menu_strict_mode),
             Item("🔓 切到宽松模式(调试)", self._menu_relaxed_mode),
