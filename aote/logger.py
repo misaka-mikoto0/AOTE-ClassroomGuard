@@ -12,6 +12,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
+class _ResilientTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """TimedRotatingFileHandler 子类：在轮转失败（如 admin 进程遗留日志文件被非 admin 进程访问时
+    os.rename 报 WinError 5）时不抛错，避免每条日志都触发 handleError 噪声。"""
+
+    def rotate(self, source, dest):
+        try:
+            super().rotate(source, dest)
+        except (PermissionError, OSError):
+            # 轮转失败则放弃这次滚动，继续向当前文件追加，后续进程有权限时再补偿
+            pass
+
+    def shouldRollover(self, record):
+        # 即使应该轮转，若上次轮转失败，本轮也不再尝试（避免每条日志都触发 PermissionError 噪声）
+        try:
+            return super().shouldRollover(record)
+        except (PermissionError, OSError):
+            return False
+
+
 class AOTELogger:
     _instance = None
     _initialized = False
@@ -54,9 +73,9 @@ class AOTELogger:
         if self.logger.handlers:
             return
 
-        # 文件日志 - 按天轮转
+        # 文件日志 - 按天轮转（resilient 版本：轮转权限失败不抛错）
         log_file = self.log_dir / "aote.log"
-        file_handler = TimedRotatingFileHandler(
+        file_handler = _ResilientTimedRotatingFileHandler(
             filename=str(log_file),
             when="midnight",
             interval=1,

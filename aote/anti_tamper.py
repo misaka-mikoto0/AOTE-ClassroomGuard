@@ -228,6 +228,42 @@ class AntiTamper:
             self.logger.debug(f"计划任务安装失败: {e}")
 
     # ============ 监控循环 ============
+    def _scan_partner_pid(self) -> Optional[int]:
+        """扫描系统进程表，找到与本进程配对的对端 PID（主进程找 watchdog，watchdog 找主进程）"""
+        try:
+            import psutil
+            script = self._get_self_script_path()
+            script_basename = os.path.basename(script).lower() if script else ""
+            # 我要找的目标模式：watchdog 找 --main，主进程找 --watchdog
+            want_arg = "--main" if self._is_watchdog else "--watchdog"
+            self_arg = "--watchdog" if self._is_watchdog else "--main"
+            my_pid = os.getpid()
+            for p in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    if p.pid == my_pid:
+                        continue
+                    cmd = " ".join(p.info.get("cmdline") or [])
+                    if not cmd:
+                        continue
+                    # 必须是本项目脚本（避免误报任意 python 进程）
+                    if script_basename and script_basename not in cmd.lower() and "all-in-one" not in cmd.lower():
+                        continue
+                    # 必须包含目标模式参数，且不包含自身模式参数
+                    if want_arg in cmd and self_arg not in cmd:
+                        # 确认进程仍可访问（防止拿到 AccessDenied 的僵死句柄）
+                        try:
+                            if psutil.Process(p.pid).is_running():
+                                return p.pid
+                        except psutil.AccessDenied:
+                            return p.pid  # 权限不足视为存活
+                        except psutil.NoSuchProcess:
+                            continue
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.debug(f"_scan_partner_pid 异常: {e}")
+        return None
+
     def _monitor_loop(self):
         interval = int(self.config.get("watchdog.monitor_interval", 2))
 
@@ -251,24 +287,59 @@ class AntiTamper:
             if self.time_guard.current_mode != TimeGuard.MODE_EMERGENCY:
                 self.logger.log_anti_tamper(
                     "extension_heartbeat_lost",
-                    f"扩展心跳超时 {int(elapsed)}s，进入紧急模式"
+                    f"扩展心跳超时 {int(elapsed)}s（不触发 emergency，避免 ProcessHunter 卡死）"
                 )
-                self.time_guard.enter_emergency_mode("extension_heartbeat_lost")
+                # 不再调用 enter_emergency_mode —— emergency 模式下 ProcessHunter
+                # 会尝试冻结 msedge.exe 等浏览器，但 Edge 是 PPL 保护进程，冻结会失败
+                # 并导致主进程卡死或被第三方杀毒软件拦截
+                # self.time_guard.enter_emergency_mode("extension_heartbeat_lost")
 
     def _check_partner_alive(self):
-        """检查对端进程是否存活"""
-        if not self._partner_pid or self._respawn_pending:
+        """检查对端进程是否存活（权限隔离兼容：AccessDenied 视为存活）
+        partner_pid 为 None 时（如 runas 复活路径或首次启动）主动重扫进程表
+        """
+        if self._respawn_pending:
             return
+        # partner_pid 为 None：尝试通过进程扫描找回对端（修复 runas 路径失忆 bug）
+        if not self._partner_pid:
+            found = self._scan_partner_pid()
+            if found:
+                self._partner_pid = found
+                self.logger.log_anti_tamper(
+                    "partner_rediscovered",
+                    f"通过进程扫描找回对端 PID={found}"
+                )
+            return  # 找回后下一轮再检查存活
         try:
             import psutil
-            if not psutil.pid_exists(self._partner_pid):
-                raise psutil.NoSuchProcess(self._partner_pid)
-            # 再确认
-            proc = psutil.Process(self._partner_pid)
-            if not proc.is_running():
-                raise Exception("not running")
-        except Exception:
-            # 对端进程已死：先清空partner_pid并标记pending，防止下次循环重复安排
+            # 先用 pid_exists 快速判断（仅判断 PID 是否在系统进程表中）
+            try:
+                if not psutil.pid_exists(self._partner_pid):
+                    raise psutil.NoSuchProcess(self._partner_pid)
+            except psutil.AccessDenied:
+                # 权限不足（管理员进程 vs 普通权限 watchdog）：视为存活
+                return
+            # 再确认进程对象可访问
+            try:
+                proc = psutil.Process(self._partner_pid)
+                if not proc.is_running():
+                    raise Exception("not running")
+            except psutil.AccessDenied:
+                # 同上：权限不足视为存活
+                return
+            except psutil.NoSuchProcess:
+                raise
+        except psutil.NoSuchProcess:
+            # 对端进程已死：先尝试重扫找替代 PID（防止 PID 复用或 runas 后 PID 失配）
+            rediscovered = self._scan_partner_pid()
+            if rediscovered and rediscovered != self._partner_pid:
+                self._partner_pid = rediscovered
+                self.logger.log_anti_tamper(
+                    "partner_rediscovered",
+                    f"对端死亡后通过扫描找到新对端 PID={rediscovered}"
+                )
+                return
+            # 真的没有对端了：清空 partner_pid 并标记 pending，防止下次循环重复安排
             dead_pid = self._partner_pid
             self._partner_pid = None
             self._respawn_pending = True
@@ -279,38 +350,85 @@ class AntiTamper:
             # 重启延迟
             delay = int(self.config.get("watchdog.restart_delay", 1))
             threading.Timer(delay, self._respawn_partner).start()
+        except Exception as e:
+            # 其他异常（如 AccessDenied 被外层捕获）：不杀进程，仅记录
+            self.logger.debug(f"_check_partner_alive 异常（不触发复活）: {e}")
 
     def _respawn_partner(self):
-        """复活对端进程"""
+        """复活对端进程（管理员进程需用 ShellExecuteW runas 提升）
+        复活前先扫描已有对端进程：避免对端已通过其他路径（计划任务/旧实例）启动后重复拉起
+        """
         try:
+            # 先扫描：如果对端已存活（如别的路径已经拉起），直接接管，不再重复 spawn
+            existing = self._scan_partner_pid()
+            if existing:
+                self._partner_pid = existing
+                self._respawn_pending = False
+                self.logger.log_anti_tamper(
+                    "partner_rediscovered",
+                    f"复活前扫描发现对端已存活 PID={existing}，直接接管"
+                )
+                return
             script = self._get_self_script_path()
             if not script:
                 return
-            target = sys.executable if script.endswith(".py") else script
-            args = [target]
-            if script.endswith(".py"):
-                args.append(script)
             # 如果我是watchdog，则复活主进程；反之复活watchdog
-            if self._is_watchdog:
-                args.append("--main")
+            is_revive_main = self._is_watchdog
+            mode_arg = "--main" if is_revive_main else "--watchdog"
+
+            # 优先用 pythonw.exe（无控制台，避免 CTRL_CLOSE_EVENT 静默退出）
+            exe = sys.executable
+            if sys.platform == "win32" and os.path.basename(exe).lower() != "pythonw.exe":
+                cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                if os.path.exists(cand):
+                    exe = cand
+
+            # 主进程需要管理员权限：用 ShellExecuteW runas 提升权限
+            # 但仅在当前是普通权限且未设置 AOTE_SKIP_ADMIN 时才用 runas；否则用 Popen 继承权限
+            need_runas = is_revive_main and sys.platform == "win32"
+            if need_runas:
+                try:
+                    cur_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+                except Exception:
+                    cur_admin = False
+                # 已经是管理员→Popen 子进程会继承；普通权限+未跳过admin→才用 runas
+                if cur_admin or os.environ.get("AOTE_SKIP_ADMIN") == "1":
+                    need_runas = False
+            if need_runas:
+                # ShellExecuteW 返回 >32 表示成功；无法直接取 PID
+                params = f'"{script}" {mode_arg}'
+                hwnd = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", exe, params, str(Path(script).parent), 0  # SW_HIDE
+                )
+                if hwnd <= 32:
+                    raise RuntimeError(f"ShellExecuteW failed: {hwnd}")
+                # 查询新启动的主进程 PID（稍后由 _check_partner_alive 通过扫描 cmdline 获取）
+                self._partner_pid = None  # 下一轮 _check_partner_alive 会重扫发现
+                self._respawn_pending = False
+                self.logger.log_anti_tamper(
+                    "partner_respawned",
+                    f"已发起复活请求（UAC），主进程即将启动"
+                )
             else:
-                args.append("--watchdog")
-
-            CREATE_NO_WINDOW = 0x08000000
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
-            creationflags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-
-            proc = subprocess.Popen(
-                args,
-                creationflags=creationflags,
-                close_fds=True
-            )
-            self._partner_pid = proc.pid
-            self._respawn_pending = False
-            self.logger.log_anti_tamper(
-                "partner_respawned",
-                f"已复活对端进程，新PID={proc.pid}"
-            )
+                # watchdog 进程不强制管理员；普通 subprocess 即可
+                args = [exe]
+                if script.endswith(".py"):
+                    args.append(script)
+                args.append(mode_arg)
+                CREATE_NO_WINDOW = 0x08000000
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                creationflags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                proc = subprocess.Popen(
+                    args,
+                    creationflags=creationflags,
+                    close_fds=True
+                )
+                self._partner_pid = proc.pid
+                self._respawn_pending = False
+                self.logger.log_anti_tamper(
+                    "partner_respawned",
+                    f"已复活对端进程，新PID={proc.pid}"
+                )
             if self._on_force_kill_detected:
                 try:
                     self._on_force_kill_detected()
