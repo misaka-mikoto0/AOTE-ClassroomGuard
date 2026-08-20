@@ -59,26 +59,23 @@ class AOTELogger:
             log_path = r"C:\ProgramData\ClassroomGuard\logs"
 
         self.retention_days = retention_days
-        self._fallback_reason = None  # 主日志路径不可写时的回退原因
-        # 候选日志目录列表：按优先级尝试，第一个可写的就用
-        # 1. 配置的主路径（C:\ProgramData\ClassroomGuard\logs，admin 模式可用）
-        # 2. %LOCALAPPDATA%\ClassroomGuard\logs（非 admin 用户目录）
-        # 3. 项目目录下的 logs/（最终保底，总是可写）
+        self._fallback_reason = None
+        # 候选日志目录：按优先级尝试，第一个能成功写入 aote.log 的就用
         project_logs = Path(__file__).resolve().parent.parent / "logs"
         candidate_dirs = [
             Path(log_path),
             Path(os.path.expandvars(r"%LOCALAPPDATA%\ClassroomGuard\logs")),
             project_logs,
         ]
+        # 直接探测 aote.log 的可写性（不是 .write_test），避免 sandbox 拦截差异
         self.log_dir = None
         for cand in candidate_dirs:
+            cand.mkdir(parents=True, exist_ok=True)
+            log_file = cand / "aote.log"
             try:
-                cand.mkdir(parents=True, exist_ok=True)
-                # 验证目录确实可写（mkdir 成功不代表能创建文件，如 sandbox 拦截）
-                test_file = cand / ".write_test"
-                with open(test_file, "w") as f:
-                    f.write("ok")
-                test_file.unlink()
+                # 尝试以追加模式打开实际日志文件
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.flush()
                 self.log_dir = cand
                 if cand != Path(log_path):
                     self._fallback_reason = f"主日志目录 {log_path} 不可写，回退到 {cand}"
@@ -86,7 +83,6 @@ class AOTELogger:
             except (PermissionError, OSError):
                 continue
         if self.log_dir is None:
-            # 所有候选都失败：用项目目录保底（mkdir 不行就直接用）
             self.log_dir = project_logs
             self._fallback_reason = f"所有日志候选目录均不可写，最终使用 {self.log_dir}（可能写失败）"
         self._setup_logger()
@@ -97,12 +93,11 @@ class AOTELogger:
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
 
-        # 避免重复添加handler
         if self.logger.handlers:
             return
 
-        # 文件日志 - 按天轮转（resilient 版本：轮转权限失败不抛错）
         log_file = self.log_dir / "aote.log"
+        file_handler = None
         try:
             file_handler = _ResilientTimedRotatingFileHandler(
                 filename=str(log_file),
@@ -111,9 +106,14 @@ class AOTELogger:
                 backupCount=self.retention_days,
                 encoding="utf-8"
             )
+            # 创建后立即写入一条测试日志，验证 stream 真的可写
+            # （某些 sandbox 会返回无效句柄而不抛异常）
+            file_handler.emit(logging.LogRecord(
+                "AOTE", logging.INFO, __file__, 0,
+                "[AOTELogger] 文件日志初始化验证", None, None
+            ))
         except (PermissionError, OSError) as e:
-            # 主日志文件不可写（如 admin 进程遗留的文件被非 admin 进程访问）：
-            # 再尝试候选列表中的其他目录
+            # 主日志文件不可写：尝试候选列表中的其他目录
             project_logs = Path(__file__).resolve().parent.parent / "logs"
             for cand in [Path(os.path.expandvars(r"%LOCALAPPDATA%\ClassroomGuard\logs")), project_logs]:
                 try:
@@ -126,13 +126,17 @@ class AOTELogger:
                         backupCount=self.retention_days,
                         encoding="utf-8"
                     )
+                    file_handler.emit(logging.LogRecord(
+                        "AOTE", logging.INFO, __file__, 0,
+                        "[AOTELogger] 文件日志回退验证", None, None
+                    ))
                     self.log_dir = cand
                     self._fallback_reason = f"主日志文件不可写({e})，回退到 {cand}"
                     break
                 except (PermissionError, OSError):
+                    file_handler = None
                     continue
-            else:
-                # 所有候选都失败：使用 NullHandler 避免 logger 调用崩溃
+            if file_handler is None:
                 file_handler = logging.NullHandler()
                 self._fallback_reason = f"所有日志路径均不可写，禁用文件日志 ({e})"
         if hasattr(file_handler, "suffix"):
