@@ -60,7 +60,14 @@ class AOTELogger:
 
         self.log_dir = Path(log_path)
         self.retention_days = retention_days
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._fallback_reason = None  # 主日志路径不可写时的回退原因
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            # 无法创建主日志目录（非 admin 访问 admin 创建的 ProgramData 子目录）：回退到用户目录
+            self._fallback_reason = f"主日志目录 {self.log_dir} 创建失败，回退到用户目录"
+            self.log_dir = Path(os.path.expandvars(r"%LOCALAPPDATA%\ClassroomGuard\logs"))
+            self.log_dir.mkdir(parents=True, exist_ok=True)
         self._setup_logger()
         self._cleanup_old_logs()
 
@@ -75,13 +82,28 @@ class AOTELogger:
 
         # 文件日志 - 按天轮转（resilient 版本：轮转权限失败不抛错）
         log_file = self.log_dir / "aote.log"
-        file_handler = _ResilientTimedRotatingFileHandler(
-            filename=str(log_file),
-            when="midnight",
-            interval=1,
-            backupCount=self.retention_days,
-            encoding="utf-8"
-        )
+        try:
+            file_handler = _ResilientTimedRotatingFileHandler(
+                filename=str(log_file),
+                when="midnight",
+                interval=1,
+                backupCount=self.retention_days,
+                encoding="utf-8"
+            )
+        except (PermissionError, OSError) as e:
+            # 主日志文件不可写（如 admin 进程遗留的文件被非 admin 进程访问）：
+            # 回退到 %LOCALAPPDATA%\ClassroomGuard\logs\aote.log
+            self.log_dir = Path(os.path.expandvars(r"%LOCALAPPDATA%\ClassroomGuard\logs"))
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = self.log_dir / "aote.log"
+            file_handler = _ResilientTimedRotatingFileHandler(
+                filename=str(log_file),
+                when="midnight",
+                interval=1,
+                backupCount=self.retention_days,
+                encoding="utf-8"
+            )
+            self._fallback_reason = f"主日志文件不可写({e})，回退到 {self.log_dir}"
         file_handler.suffix = "%Y%m%d"
         file_fmt = logging.Formatter(
             "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
@@ -90,6 +112,11 @@ class AOTELogger:
         file_handler.setFormatter(file_fmt)
         file_handler.setLevel(logging.DEBUG)
         self.logger.addHandler(file_handler)
+        if self._fallback_reason:
+            # 用 stderr 输出回退提示（logger 刚建好，可以直接 info 但确保看到）
+            import sys
+            print(f"[AOTELogger] {self._fallback_reason}", file=sys.stderr, flush=True)
+            self.logger.warning(self._fallback_reason)
 
     def _cleanup_old_logs(self):
         """清理超过保留天数的日志文件"""
