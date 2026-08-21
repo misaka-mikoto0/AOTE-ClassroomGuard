@@ -111,6 +111,17 @@ logging:
   path: "C:\\ProgramData\\ClassroomGuard\\logs"
   retention_days: 30
 
+# 浏览器控制沙盒（Playwright）：在独立 Chromium 实例内拦截/注入/监控网络
+browser_sandbox:
+  enabled: true                # 是否随主进程自动启动
+  headless: false              # false=有头模式（可观察控制过程）；true=无头后台
+  user_data_dir: ""            # 独立用户数据目录，留空= %LOCALAPPDATA%\AOTE\chromium_profile（不污染主浏览器）
+  default_url: "about:blank"   # 启动后默认打开的页面
+  max_captured: 1000           # 响应捕获缓冲上限
+  # 自定义 Chromium 启动参数（覆盖默认值，含 --disable-web-security /
+  # --proxy-server / --remote-debugging-port；--user-data-dir 始终自动追加）
+  launch_args: []
+
 # HTTP服务配置（浏览器扩展通信）
 http_server:
   host: "127.0.0.1"

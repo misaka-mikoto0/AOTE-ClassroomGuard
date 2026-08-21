@@ -7,3 +7,6 @@ PyYAML>=6.0
 cryptography>=41.0.0
 schedule>=1.2.0
 keyboard>=0.13.5
+# 浏览器控制沙盒（Playwright for Python）
+# 安装后还需执行:  python -m playwright install chromium
+playwright>=1.40.0

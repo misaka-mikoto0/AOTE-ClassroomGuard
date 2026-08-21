@@ -91,11 +91,22 @@ class ConfigManager:
                 },
                 "exceptions": {}
             },
-            "target_processes": {
-                "browsers": ["chrome.exe", "msedge.exe", "firefox.exe"],
-                "video": ["vlc.exe", "potplayer.exe", "bilibili.exe"],
-                "games": ["steam.exe", "wegame.exe"],
-                "math_lockdown": ["calc.exe", "calculator.exe", "chrome.exe", "msedge.exe"]
+            "browser_rules": {
+                "block_domains": [
+                    "bilibili.com", "youtube.com", "youku.com",
+                    "iqiyi.com", "douyin.com", "steampowered.com",
+                    "4399.com", "7k7k.com"
+                ],
+                "allowed_domains": [
+                    "edu.cn", "gov.cn", "baidu.com", "bing.com",
+                    "qq.com", "alipay.com"
+                ],
+                "math_lockdown_domains": [
+                    "mathway.com", "wolframalpha.com", "symbolab.com",
+                    "photomath.com", "desmos.com", "calculator.net"
+                ],
+                "blocked_page_html": "",
+                "math_lockdown_page_html": ""
             },
             "math_challenge": {
                 "level_1_reward_seconds": 300,
@@ -130,13 +141,6 @@ class ConfigManager:
                 "host": "127.0.0.1",
                 "port": 8765,
                 "extension_heartbeat_timeout": 30
-            },
-            "watchdog": {
-                "monitor_interval": 2,
-                "restart_delay": 1
-            },
-            "process_hunter": {
-                "scan_interval": 0.5
             }
         }
 
@@ -161,19 +165,22 @@ class ConfigManager:
                 return default
 
     @property
-    def all_target_processes(self) -> List[str]:
-        """获取所有需要冻结的目标进程"""
+    def browser_block_domains(self) -> List[str]:
+        """获取严格模式下拦截的娱乐/游戏域名列表"""
         with self._lock:
-            processes = set()
-            targets = self._config.get("target_processes", {})
-            for key in ["browsers", "video", "games"]:
-                for p in targets.get(key, []):
-                    processes.add(p.lower())
-            return list(processes)
+            rules = self._config.get("browser_rules", {})
+            return [str(d).lower().strip() for d in rules.get("block_domains", [])]
 
     @property
-    def math_lockdown_processes(self) -> List[str]:
-        """获取数学题期间需要冻结的进程（计算器、浏览器等）"""
+    def browser_allowed_domains(self) -> List[str]:
+        """获取白名单域名列表"""
         with self._lock:
-            targets = self._config.get("target_processes", {})
-            return [p.lower() for p in targets.get("math_lockdown", [])]
+            rules = self._config.get("browser_rules", {})
+            return [str(d).lower().strip() for d in rules.get("allowed_domains", [])]
+
+    @property
+    def math_lockdown_domains(self) -> List[str]:
+        """获取数学挑战期间拦截的解题工具域名列表"""
+        with self._lock:
+            rules = self._config.get("browser_rules", {})
+            return [str(d).lower().strip() for d in rules.get("math_lockdown_domains", [])]

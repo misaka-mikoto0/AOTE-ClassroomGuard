@@ -68,11 +68,14 @@ class AOTELogger:
             project_logs,
         ]
         # 直接探测 aote.log 的可写性（不是 .write_test），避免 sandbox 拦截差异
+        # 注意：mkdir 必须在 try 内！否则目录存在但无访问权限（如 admin 创建的
+        # %LOCALAPPDATA%\ClassroomGuard 被非 admin 进程访问）时，
+        # PermissionError 会逃逸导致主程序启动即崩溃。
         self.log_dir = None
         for cand in candidate_dirs:
-            cand.mkdir(parents=True, exist_ok=True)
-            log_file = cand / "aote.log"
             try:
+                cand.mkdir(parents=True, exist_ok=True)
+                log_file = cand / "aote.log"
                 # 尝试以追加模式打开实际日志文件
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.flush()
@@ -83,8 +86,18 @@ class AOTELogger:
             except (PermissionError, OSError):
                 continue
         if self.log_dir is None:
-            self.log_dir = project_logs
-            self._fallback_reason = f"所有日志候选目录均不可写，最终使用 {self.log_dir}（可能写失败）"
+            # 终极兜底：系统临时目录（任何用户均可写），保证日志模块永不导致主程序崩溃
+            try:
+                import tempfile
+                tmp_cand = Path(tempfile.gettempdir()) / "ClassroomGuard" / "logs"
+                tmp_cand.mkdir(parents=True, exist_ok=True)
+                with open(tmp_cand / "aote.log", "a", encoding="utf-8") as f:
+                    f.flush()
+                self.log_dir = tmp_cand
+                self._fallback_reason = f"候选日志目录均不可写，回退到临时目录 {tmp_cand}"
+            except Exception:
+                self.log_dir = None
+                self._fallback_reason = "所有日志路径均不可用，仅使用控制台输出"
         self._setup_logger()
         self._cleanup_old_logs()
 
@@ -94,6 +107,21 @@ class AOTELogger:
         self.logger.propagate = False
 
         if self.logger.handlers:
+            return
+
+        if self.log_dir is None:
+            # 所有磁盘路径均不可用：仅控制台输出，保证日志模块绝不崩溃主程序
+            stream_handler = logging.StreamHandler()
+            stream_fmt = logging.Formatter(
+                "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"
+            )
+            stream_handler.setFormatter(stream_fmt)
+            stream_handler.setLevel(logging.DEBUG)
+            self.logger.addHandler(stream_handler)
+            import sys
+            print(f"[AOTELogger] {self._fallback_reason}", file=sys.stderr, flush=True)
+            self.logger.warning(self._fallback_reason)
             return
 
         log_file = self.log_dir / "aote.log"
@@ -155,6 +183,8 @@ class AOTELogger:
 
     def _cleanup_old_logs(self):
         """清理超过保留天数的日志文件"""
+        if self.log_dir is None:
+            return
         try:
             cutoff = datetime.now() - timedelta(days=self.retention_days)
             for log_file in self.log_dir.glob("aote.log.*"):

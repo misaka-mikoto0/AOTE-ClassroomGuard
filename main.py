@@ -67,6 +67,7 @@ from aote.usb_guard import USBGuard, USBModeSelector
 from aote.anti_tamper import AntiTamper
 from aote.http_server import AOTEHTTPServer
 from aote.system_tray import SystemTray
+from aote.browser_sandbox import BrowserSandbox
 
 
 # ======================================================
@@ -194,6 +195,7 @@ class GuardianApp:
         self.anti_tamper: Optional[AntiTamper] = None
         self.http_server: Optional[AOTEHTTPServer] = None
         self.system_tray: Optional[SystemTray] = None
+        self.browser_sandbox: Optional[BrowserSandbox] = None
 
         # 控制
         self._shutdown = threading.Event()
@@ -245,6 +247,12 @@ class GuardianApp:
         )
         self.system_tray.on_emergency_exit_request = self._tray_emergency_exit
         self.system_tray.on_show_math_challenge = self._show_math_challenge_from_tray
+
+        # 浏览器控制沙盒（Playwright）：将「拦截浏览器」升级为「在独立 Chromium 内控制浏览器内容」
+        if self.config.get("browser_sandbox.enabled", False):
+            self.browser_sandbox = BrowserSandbox(self.config, self.logger)
+        else:
+            self.logger.debug("[Sandbox] 已按配置禁用（browser_sandbox.enabled=false）")
 
         # 注册紧急热键 Ctrl+Shift+Alt+G
         self._register_hotkey()
@@ -478,6 +486,12 @@ class GuardianApp:
         self.http_server.start()
         self.usb_guard.start()
         self.system_tray.start()
+        # 浏览器控制沙盒（独立 Chromium）；失败不影响主控核心功能
+        if self.browser_sandbox is not None:
+            try:
+                self.browser_sandbox.start()
+            except Exception as e:
+                self.logger.error(f"[Sandbox] 启动异常（已跳过）: {e}")
         # 自启动安装
         try:
             self.anti_tamper.install_autostart()
@@ -508,6 +522,12 @@ class GuardianApp:
         self.logger.info("🛑 正在关闭系统...")
         self._kill_watchdog()
         try:
+            # 先关闭浏览器沙盒，释放独立 Chromium 进程
+            if self.browser_sandbox:
+                try:
+                    self.browser_sandbox.stop()
+                except Exception as e:
+                    self.logger.debug(f"[Sandbox] 关闭异常: {e}")
             if self.system_tray: self.system_tray.stop()
             if self.usb_guard: self.usb_guard.stop()
             if self.http_server: self.http_server.stop()

@@ -12,6 +12,13 @@ import time
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
+# 兼容 GBK 控制台：确保 ✔ ✗ 🎉 等 Unicode 字符可输出（Windows 默认 cp936）
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def test_config():
     print("=" * 60)
