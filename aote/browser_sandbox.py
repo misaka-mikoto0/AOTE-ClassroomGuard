@@ -369,6 +369,42 @@ class BrowserSandbox:
         with self._state_lock:
             return self._control_mode
 
+    def block_url_now(self, url: str) -> None:
+        """即时将指定 URL 加入临时黑名单（HTTP 上报违禁内容时调用）。
+        该 URL 在严格模式下也会被拦截，直到调用 unblock_url() 或切换模式。"""
+        from urllib.parse import urlparse
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+        if not host:
+            return
+        with self._state_lock:
+            self._block_domains.append(host)
+            # 避免无限膨胀
+            self._block_domains = self._block_domains[-500:]
+        self.logger.info(f"[Sandbox] 即时拦截域名: {host}")
+
+    def unblock_url(self, url: str) -> None:
+        """从临时黑名单移除指定 URL（不触碰配置中的永久名单）。"""
+        from urllib.parse import urlparse
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+        if not host:
+            return
+        cfg_domains = [d.lower().strip()
+                       for d in (self.config.get("browser_rules.block_domains", []) or [])]
+        with self._state_lock:
+            remaining = []
+            for d in self._block_domains:
+                if d == host and d not in cfg_domains:
+                    continue  # 仅移除动态加入的
+                remaining.append(d)
+            self._block_domains = remaining
+        self.logger.info(f"[Sandbox] 解除即时拦截域名: {host}")
+
     def heartbeat(self) -> float:
         """心跳：返回自上次浏览器活动以来的秒数。供 AntiTamper 检测沙盒存活。"""
         now = time.time()

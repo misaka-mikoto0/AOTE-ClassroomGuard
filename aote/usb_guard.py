@@ -20,7 +20,6 @@ from ctypes import wintypes
 
 from .config import ConfigManager
 from .logger import AOTELogger
-from .process_hunter import ProcessHunter
 
 
 # ============== Windows API & 常量 ==============
@@ -52,11 +51,9 @@ def _sha256_str(text: str) -> str:
 class USBGuard:
     """U盘授权守护者"""
 
-    def __init__(self, config: ConfigManager, logger: AOTELogger,
-                 process_hunter: ProcessHunter):
+    def __init__(self, config: ConfigManager, logger: AOTELogger):
         self.config = config
         self.logger = logger
-        self.process_hunter = process_hunter
 
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
@@ -312,11 +309,9 @@ class USBGuard:
 class USBModeSelector:
     """U盘授权后弹出的模式选择GUI窗口"""
 
-    def __init__(self, config: ConfigManager, logger: AOTELogger,
-                 process_hunter: ProcessHunter):
+    def __init__(self, config: ConfigManager, logger: AOTELogger):
         self.config = config
         self.logger = logger
-        self.process_hunter = process_hunter
         self.selected_mode: Optional[str] = None
         self._result_event = threading.Event()
         self._thread: Optional[threading.Thread] = None

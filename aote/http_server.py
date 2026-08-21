@@ -1,28 +1,29 @@
 """
-AOTE 管控系统 - 本地HTTP服务（浏览器扩展通信）
+AOTE 管控系统 - 本地HTTP服务（浏览器内容管控上报）
 端点：
-  GET  /ping   扩展心跳
-  POST /kill   上报违禁内容（触发冻结）
+  GET  /ping    存活检查
+  GET  /status  查询当前管控状态
+  POST /kill    上报浏览器内违禁内容（触发数学挑战 / 记录拦截）
 监听 127.0.0.1:8765，仅接受本地连接
 """
 import threading
 import time
 import json
-from typing import Optional
+from typing import Optional, Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .config import ConfigManager
 from .logger import AOTELogger
-from .anti_tamper import AntiTamper
-from .process_hunter import ProcessHunter
+from .browser_sandbox import BrowserSandbox
 
 
 class AOTEHTTPHandler(BaseHTTPRequestHandler):
     """HTTP请求处理器"""
     server_config: Optional[ConfigManager] = None
     server_logger: Optional[AOTELogger] = None
-    server_anti_tamper: Optional[AntiTamper] = None
-    server_process_hunter: Optional[ProcessHunter] = None
+    server_browser_sandbox: Optional[BrowserSandbox] = None
+    # 违禁内容上报回调 on_violation(url, reason, level)
+    server_on_violation: Optional[Callable[[str, str, int], None]] = None
 
     def log_message(self, format, *args):
         """屏蔽默认的stderr日志，改用我们的"""
@@ -41,13 +42,10 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
         """确保只接受本地连接"""
         try:
             client_ip = self.client_address[0]
-            # 注意：TCP socket 的 client_address[0] 一定是 IP 字符串，永远不会是 "localhost"（DNS层概念），
-            # 所以只检查 127.0.0.1 / ::1 即可。
             if client_ip not in ("127.0.0.1", "::1"):
                 self._send_json(403, {"error": "local_only"})
                 return False
         except Exception:
-            # 拿不到客户端地址时保守起见：拒绝
             try:
                 self._send_json(403, {"error": "local_only"})
             except Exception:
@@ -59,24 +57,26 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
         if not self._check_local_only():
             return
         if self.path.startswith("/ping"):
-            # 心跳
-            if self.server_anti_tamper:
-                self.server_anti_tamper.report_extension_heartbeat()
             self._send_json(200, {"alive": True, "timestamp": int(time.time())})
         elif self.path.startswith("/status"):
             # 调试：查询当前状态
             mode = "unknown"
             unlocked = False
+            sandbox_running = False
             try:
-                from .time_guard import TimeGuard
-                tg = self.server_process_hunter.time_guard if self.server_process_hunter else None
-                if tg:
-                    mode = tg.current_mode
-                if self.server_process_hunter:
-                    unlocked = self.server_process_hunter.is_unlocked
+                sb = self.server_browser_sandbox
+                if sb is not None:
+                    sandbox_running = sb.is_running
+                    if sandbox_running:
+                        mode = sb.current_mode()
+                        unlocked = sb.is_unlocked()
             except Exception:
                 pass
-            self._send_json(200, {"mode": mode, "unlocked": unlocked})
+            self._send_json(200, {
+                "mode": mode,
+                "unlocked": unlocked,
+                "sandbox_running": sandbox_running,
+            })
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -95,31 +95,27 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
                 level = payload.get("level", 1)
 
                 if self.server_logger:
-                    self.server_logger.warning(
-                        f"[扩展拦截] 违禁内容: {url} 原因: {reason} (level={level})"
-                    )
+                    self.server_logger.log_browser_intercept(url, reason, "report")
 
-                frozen_pids = []
-                if self.server_process_hunter:
-                    # 检查是否允许冻结（解锁时不冻结）
-                    if not self.server_process_hunter.is_unlocked:
-                        # 只冻结浏览器（遵循正常冻结流程：进程树遍历+已冻结检查）
-                        import psutil
-                        browsers = self.server_config.get("target_processes.browsers", [])
-                        browsers_set = {b.lower() for b in browsers}
-                        for p in psutil.process_iter(["pid", "name"]):
-                            try:
-                                if p.name().lower() in browsers_set:
-                                    # 使用公有冻结流程：进程树展开
-                                    proctree = self.server_process_hunter._get_process_tree(p)
-                                    for tp in proctree:
-                                        # _freeze_process 内部有已冻结检查，可安全调用
-                                        self.server_process_hunter._freeze_process(tp)
-                                        frozen_pids.append(tp.pid)
-                            except Exception:
-                                pass
+                # 浏览器内容管控：交由 Orchestrator 处理（触发数学挑战等）
+                if self.server_on_violation:
+                    try:
+                        self.server_on_violation(url, reason, level)
+                    except Exception as e:
+                        if self.server_logger:
+                            self.server_logger.error(f"[HTTP] 违规回调异常: {e}")
 
-                self._send_json(200, {"status": "ok", "frozen": frozen_pids})
+                # 附加：若沙盒运行中，直接阻止该域名（添加到实时拦截清单）
+                blocked_now = False
+                if self.server_browser_sandbox is not None:
+                    try:
+                        self.server_browser_sandbox.block_url_now(url)
+                        blocked_now = True
+                    except Exception as e:
+                        if self.server_logger:
+                            self.server_logger.debug(f"[HTTP] 沙盒即时拦截失败: {e}")
+
+                self._send_json(200, {"status": "ok", "blocked_now": blocked_now})
             except Exception as e:
                 if self.server_logger:
                     self.server_logger.error(f"[HTTP] /kill 异常: {e}")
@@ -132,15 +128,20 @@ class AOTEHTTPServer:
     """封装的HTTP服务"""
 
     def __init__(self, config: ConfigManager, logger: AOTELogger,
-                 anti_tamper: AntiTamper, process_hunter: ProcessHunter):
+                 browser_sandbox: BrowserSandbox):
         self.config = config
         self.logger = logger
-        self.anti_tamper = anti_tamper
-        self.process_hunter = process_hunter
+        self.browser_sandbox = browser_sandbox
 
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+
+        # 违规上报回调（由主程序注入：触发数学挑战等）
+        self._on_violation: Optional[Callable[[str, str, int], None]] = None
+
+    def set_on_violation(self, cb: Callable[[str, str, int], None]):
+        self._on_violation = cb
 
     def start(self):
         host = self.config.get("http_server.host", "127.0.0.1")
@@ -149,8 +150,8 @@ class AOTEHTTPServer:
         # 注入类属性
         AOTEHTTPHandler.server_config = self.config
         AOTEHTTPHandler.server_logger = self.logger
-        AOTEHTTPHandler.server_anti_tamper = self.anti_tamper
-        AOTEHTTPHandler.server_process_hunter = self.process_hunter
+        AOTEHTTPHandler.server_browser_sandbox = self.browser_sandbox
+        AOTEHTTPHandler.server_on_violation = self._on_violation
 
         try:
             self._server = ThreadingHTTPServer((host, port), AOTEHTTPHandler)

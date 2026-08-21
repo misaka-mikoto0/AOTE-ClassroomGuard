@@ -3,7 +3,7 @@ AOTE 管控系统 - 数学挑战模块（Math Challenge）
 核心要求：
 1. 题目为四位数加减乘除法运算
 2. 结果必须是10位数
-3. 做题期间冻结计算器、浏览器等能解数学题的工具
+3. 做题期间通过浏览器沙盒拦截数学解题工具站点（纯浏览器层面，无进程操作）
 """
 import random
 import time
@@ -19,7 +19,7 @@ from tkinter import ttk, messagebox
 
 from .config import ConfigManager
 from .logger import AOTELogger
-from .process_hunter import ProcessHunter
+from .browser_sandbox import BrowserSandbox, MODE_MATH_LOCKDOWN
 
 
 @dataclass
@@ -212,14 +212,15 @@ class MathChallengeWindow:
     """
 
     def __init__(self, config: ConfigManager, logger: AOTELogger,
-                 process_hunter: ProcessHunter,
+                 browser_sandbox: BrowserSandbox,
                  on_success: Callable[[int], None]):
         """
+        :param browser_sandbox: 浏览器沙盒（做题期间切换为数学挑战拦截模式）
         :param on_success: 答题成功回调 on_success(unlock_seconds)
         """
         self.config = config
         self.logger = logger
-        self.process_hunter = process_hunter
+        self.browser_sandbox = browser_sandbox
         self.on_success = on_success
 
         self.generator = QuestionGenerator(config)
@@ -244,17 +245,24 @@ class MathChallengeWindow:
         # 线程相关
         self._thread: Optional[threading.Thread] = None
 
-    # ============ 防作弊：冻结数学工具 ============
+    # ============ 防作弊：浏览器内容拦截 ============
     def _enter_math_lockdown(self):
-        """进入做题模式：冻结所有计算器、浏览器等"""
-        targets = self.config.math_lockdown_processes
-        self.process_hunter.set_extra_targets(targets)
-        self.logger.info("[MathChallenge] 数学题防作弊锁定已启用")
+        """进入做题模式：浏览器沙盒切换到数学挑战拦截模式（拦截解题工具站点）"""
+        if self.browser_sandbox is not None:
+            try:
+                self.browser_sandbox.set_control_mode(MODE_MATH_LOCKDOWN)
+                self.logger.info("[MathChallenge] 数学题防作弊浏览器拦截已启用")
+            except Exception as e:
+                self.logger.error(f"[MathChallenge] 启用浏览器拦截失败: {e}")
 
     def _exit_math_lockdown(self):
-        """退出做题模式：恢复计算器等"""
-        self.process_hunter.clear_extra_targets()
-        self.logger.info("[MathChallenge] 数学题防作弊锁定已解除")
+        """退出做题模式：恢复严格管控"""
+        if self.browser_sandbox is not None:
+            try:
+                self.browser_sandbox.restore_strict_mode()
+                self.logger.info("[MathChallenge] 数学题防作弊浏览器拦截已解除")
+            except Exception as e:
+                self.logger.error(f"[MathChallenge] 解除浏览器拦截失败: {e}")
 
     # ============ 题目操作 ============
     def _new_question(self, level: int):
@@ -494,12 +502,12 @@ class MathChallengeWindow:
         bottom.pack_propagate(False)
 
         tk.Label(
-            bottom, text="💡 做题期间计算器和浏览器已禁用",
+            bottom, text="💡 做题期间已拦截解题工具网站",
             font=SMALL_FONT, fg="#8c8c8c", bg="#ffffff"
         ).pack(side=tk.LEFT, padx=20)
 
         tk.Button(
-            bottom, text="🚪 退出并关闭浏览器",
+            bottom, text="🚪 放弃挑战",
             font=BTN_FONT, bg="#ff4d4f", fg="white",
             activebackground="#cf1322", activeforeground="white",
             relief=tk.FLAT, padx=20, pady=8, cursor="hand2",
@@ -554,30 +562,15 @@ class MathChallengeWindow:
 
     # ============ 退出按钮 ============
     def _on_exit_clicked(self):
-        """退出按钮：关闭浏览器进程并关闭答题窗口"""
-        self.logger.info("[MathChallenge] 用户点击退出按钮，关闭浏览器并退出")
+        """退出按钮：放弃挑战并关闭答题窗口（不涉及任何进程操作）"""
+        self.logger.info("[MathChallenge] 用户点击退出按钮，放弃挑战")
         self._cancel_countdown()
-        self._kill_browser_processes()
         self._success = False
         try:
             if self.root:
                 self.root.destroy()
         except Exception:
             pass
-
-    def _kill_browser_processes(self):
-        """终止所有浏览器进程"""
-        import psutil
-        browsers = set(b.lower() for b in self.config.get("target_processes.browsers", []))
-        killed = 0
-        for p in psutil.process_iter(["pid", "name"]):
-            try:
-                if p.name().lower() in browsers:
-                    p.terminate()
-                    killed += 1
-            except Exception:
-                pass
-        self.logger.info(f"[MathChallenge] 退出时终止了 {killed} 个浏览器进程")
 
     # ============ 显示/等待 ============
     def show_and_wait(self, level: int = 1) -> bool:

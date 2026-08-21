@@ -235,21 +235,20 @@ class AOTELogger:
                         reason=reason,
                         timestamp=datetime.now().isoformat())
 
-    def log_process_freeze(self, pid: int, process_name: str, reason: str = "target_detected"):
-        """进程冻结日志"""
-        self._log_event("PROCESS_FREEZE", "INFO",
-                        f"冻结进程: {process_name}",
-                        pid=pid,
-                        process_name=process_name,
-                        reason=reason)
+    def log_browser_intercept(self, url: str, reason: str, mode: str = ""):
+        """浏览器内容拦截日志（替代原进程冻结日志）"""
+        self._log_event("BROWSER_BLOCK", "INFO",
+                        f"浏览器拦截: {url}",
+                        url=url,
+                        reason=reason,
+                        mode=mode)
 
-    def log_process_unfreeze(self, pid: int, process_name: str, duration_seconds: int = 0):
-        """进程解冻日志"""
-        self._log_event("PROCESS_UNFREEZE", "INFO",
-                        f"解冻进程: {process_name}",
-                        pid=pid,
-                        process_name=process_name,
-                        duration_seconds=duration_seconds)
+    def log_browser_unlock(self, url: str, seconds: int = 0):
+        """浏览器解锁日志"""
+        self._log_event("BROWSER_UNLOCK", "INFO",
+                        f"浏览器解锁: {url}",
+                        url=url,
+                        seconds=seconds)
 
     def log_math_attempt(self, question: str, user_answer: str,
                          correct_answer: str, is_correct: bool,

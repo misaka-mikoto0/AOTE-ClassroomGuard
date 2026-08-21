@@ -11,18 +11,18 @@ from typing import Optional, Callable
 from .config import ConfigManager
 from .logger import AOTELogger
 from .time_guard import TimeGuard
-from .process_hunter import ProcessHunter
+from .browser_sandbox import BrowserSandbox
 
 
 class SystemTray:
     """系统托盘图标与菜单"""
 
     def __init__(self, config: ConfigManager, logger: AOTELogger,
-                 time_guard: TimeGuard, process_hunter: ProcessHunter):
+                 time_guard: TimeGuard, browser_sandbox: BrowserSandbox):
         self.config = config
         self.logger = logger
         self.time_guard = time_guard
-        self.process_hunter = process_hunter
+        self.browser_sandbox = browser_sandbox
 
         self._icon = None
         self._thread: Optional[threading.Thread] = None
@@ -78,21 +78,38 @@ class SystemTray:
         if hasattr(self.time_guard, "_emergency_forced"):
             self.time_guard._emergency_forced = False
         self.time_guard._set_mode(TimeGuard.MODE_STRICT, "tray_strict")
-        self.process_hunter.restore_strict_mode()
+        if self.browser_sandbox is not None:
+            try:
+                self.browser_sandbox.restore_strict_mode()
+            except Exception as e:
+                self.logger.debug(f"[Tray] 恢复浏览器严格管控失败: {e}")
 
     def _menu_relaxed_mode(self, *args):
         """切换到宽松模式（调试用）"""
         if hasattr(self.time_guard, "_emergency_forced"):
             self.time_guard._emergency_forced = False
         self.time_guard._set_mode(TimeGuard.MODE_RELAXED, "tray_relaxed")
+        if self.browser_sandbox is not None:
+            try:
+                self.browser_sandbox.set_control_mode("relaxed")
+            except Exception as e:
+                self.logger.debug(f"[Tray] 切换浏览器宽松模式失败: {e}")
 
     def _menu_temp_unlock_5min(self, *args):
         """临时解锁5分钟"""
-        self.process_hunter.temporary_unlock(300)
+        if self.browser_sandbox is not None:
+            try:
+                self.browser_sandbox.temporary_unlock(300)
+            except Exception as e:
+                self.logger.debug(f"[Tray] 浏览器临时解锁失败: {e}")
 
     def _menu_temp_unlock_30min(self, *args):
         """临时解锁30分钟"""
-        self.process_hunter.temporary_unlock(1800)
+        if self.browser_sandbox is not None:
+            try:
+                self.browser_sandbox.temporary_unlock(1800)
+            except Exception as e:
+                self.logger.debug(f"[Tray] 浏览器临时解锁失败: {e}")
 
     def _menu_math_challenge(self, *args):
         """显示数学挑战"""
@@ -102,13 +119,20 @@ class SystemTray:
     def _menu_status(self, *args):
         """显示当前状态（弹消息）"""
         mode_cn = {
-            TimeGuard.MODE_STRICT: "严格模式（冻结目标）",
+            TimeGuard.MODE_STRICT: "严格模式（管控浏览器内容）",
             TimeGuard.MODE_RELAXED: "宽松模式（上课时间）",
             TimeGuard.MODE_EMERGENCY: "紧急模式（安全威胁）",
         }
         mode = mode_cn.get(self.time_guard.current_mode, "未知")
-        unlock_status = "已解锁" if self.process_hunter.is_unlocked else "管控中"
-        msg = f"AOTE 实力主义一体机管控系统\n\n当前模式: {mode}\n进程: {unlock_status}\n\nPID: {os.getpid()}"
+        try:
+            sandbox_mode = self.browser_sandbox.current_mode() if self.browser_sandbox else "未启用"
+            unlocked = self.browser_sandbox.is_unlocked() if self.browser_sandbox else False
+        except Exception:
+            sandbox_mode, unlocked = "未知", False
+        unlock_status = "已解锁" if unlocked else "管控中"
+        msg = (f"AOTE 实力主义一体机管控系统\n\n"
+               f"当前模式: {mode}\n"
+               f"浏览器: {sandbox_mode} ({unlock_status})")
         try:
             import tkinter as tk
             from tkinter import messagebox
@@ -152,7 +176,11 @@ class SystemTray:
                 TimeGuard.MODE_EMERGENCY: "[紧急]",
             }
             mode = mode_short.get(self.time_guard.current_mode, "")
-            unlock = "✓已解锁" if self.process_hunter.is_unlocked else "✗管控中"
+            try:
+                unlocked = self.browser_sandbox.is_unlocked() if self.browser_sandbox else False
+            except Exception:
+                unlocked = False
+            unlock = "✓已解锁" if unlocked else "✗管控中"
             return f"{mode} {unlock}"
 
         # 构建菜单

@@ -27,49 +27,44 @@ schedule:
     "2026-09-10": "holiday"    # 教师节放假
     "2026-10-08": "classday"   # 调休上课
 
-# 目标进程名单（需要冻结的进程）
-target_processes:
-  browsers:
-    - "chrome.exe"
-    - "msedge.exe"
-    - "firefox.exe"
-    - "brave.exe"
-    - "opera.exe"
-    - "vivaldi.exe"
-    - "qqbrowser.exe"
-    - "360chrome.exe"
-  video:
-    - "vlc.exe"
-    - "potplayer.exe"
-    - "mpc-hc.exe"
-    - "mpv.exe"
-    - "bilibili.exe"
-    - "youku.exe"
-    - "iqiyi.exe"
-    - "qqplayer.exe"
-  games:
-    - "steam.exe"
-    - "epicgameslauncher.exe"
-    - "wegame.exe"
-  # 数学题期间额外冻结的进程（计算器、浏览器等）
-  math_lockdown:
-    - "calc.exe"
-    - "calculator.exe"
-    - "calc1.exe"
-    - "win32calc.exe"
-    - "chrome.exe"
-    - "msedge.exe"
-    - "firefox.exe"
-    - "brave.exe"
-    - "opera.exe"
-    - "vivaldi.exe"
-    - "qqbrowser.exe"
-    - "360chrome.exe"
-    - "mathway.exe"
-    - "photomath.exe"
-    - "wolframalpha.exe"
-    - "symbolab.exe"
-    - "qianwen.exe"
+# 浏览器内容管控规则（基于域名，无需操作系统进程操作）
+browser_rules:
+  # 严格模式下拦截的娱乐/游戏域名（访问即触发数学挑战）
+  block_domains:
+    - "bilibili.com"
+    - "youtube.com"
+    - "youku.com"
+    - "iqiyi.com"
+    - "douyin.com"
+    - "kuaishou.com"
+    - "steampowered.com"
+    - "epicgames.com"
+    - "4399.com"
+    - "7k7k.com"
+    - "wanmei.com"
+    - "gog.com"
+  # 白名单域名（始终放行，如学习/政务站点）
+  allowed_domains:
+    - "edu.cn"
+    - "gov.cn"
+    - "baidu.com"
+    - "bing.com"
+    - "qq.com"
+    - "alipay.com"
+  # 数学挑战期间拦截的解题工具域名
+  math_lockdown_domains:
+    - "mathway.com"
+    - "wolframalpha.com"
+    - "symbolab.com"
+    - "photomath.com"
+    - "desmos.com"
+    - "calculator.net"
+    - "mathpapa.com"
+    - "cymath.com"
+    - "quickmath.com"
+  # 自定义拦截页 HTML（留空使用内置默认页）
+  blocked_page_html: ""
+  math_lockdown_page_html: ""
 
 # 数学挑战配置
 math_challenge:
@@ -111,7 +106,7 @@ logging:
   path: "C:\\ProgramData\\ClassroomGuard\\logs"
   retention_days: 30
 
-# 浏览器控制沙盒（Playwright）：在独立 Chromium 实例内拦截/注入/监控网络
+# 浏览器控制沙盒（Playwright）：在独立 Chromium 实例内直接管控浏览器内容
 browser_sandbox:
   enabled: true                # 是否随主进程自动启动
   headless: false              # false=有头模式（可观察控制过程）；true=无头后台
@@ -122,17 +117,8 @@ browser_sandbox:
   # --proxy-server / --remote-debugging-port；--user-data-dir 始终自动追加）
   launch_args: []
 
-# HTTP服务配置（浏览器扩展通信）
+# HTTP服务配置（浏览器沙盒通信/状态上报）
 http_server:
   host: "127.0.0.1"
   port: 8765
-  extension_heartbeat_timeout: 30  # 秒
-
-# 双进程守护
-watchdog:
-  monitor_interval: 2  # 秒，检查对端是否存活
-  restart_delay: 1     # 秒，重启延迟
-
-# 进程扫描间隔
-process_hunter:
-  scan_interval: 0.5   # 秒
+  heartbeat_timeout: 30  # 秒，沙盒心跳超时阈值
