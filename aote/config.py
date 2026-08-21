@@ -101,22 +101,15 @@ class ConfigManager:
                     "edu.cn", "gov.cn", "baidu.com", "bing.com",
                     "qq.com", "alipay.com"
                 ],
-                "math_lockdown_domains": [
-                    "mathway.com", "wolframalpha.com", "symbolab.com",
-                    "photomath.com", "desmos.com", "calculator.net"
-                ],
                 "blocked_page_html": "",
-                "math_lockdown_page_html": ""
-            },
-            "math_challenge": {
-                "level_1_reward_seconds": 300,
-                "level_2_reward_seconds": 600,
-                "question_params": {
-                    "min_number": 1000,
-                    "max_number": 9999,
-                    "result_min": 1000000000,
-                    "result_max": 9999999999,
-                    "operations": ["+", "-", "*", "/"]
+                "video_block_enabled": True,
+                "weak_network": {
+                    "enabled": True,
+                    "delay_ms": 3000,
+                    "latency_ms": 800,
+                    "download_kbps": 128,
+                    "upload_kbps": 64,
+                    "min_duration": 15
                 }
             },
             "usb_guard": {
@@ -141,6 +134,17 @@ class ConfigManager:
                 "host": "127.0.0.1",
                 "port": 8765,
                 "heartbeat_timeout": 30
+            },
+            "browser_sandbox": {
+                "enabled": True,
+                "headless": False,
+                "browser_channel": "auto",
+                "executable_path": "",
+                "connect_cdp_url": "",
+                "user_data_dir": "",
+                "default_url": "about:blank",
+                "max_captured": 1000,
+                "launch_args": []
             }
         }
 
@@ -179,8 +183,16 @@ class ConfigManager:
             return [str(d).lower().strip() for d in rules.get("allowed_domains", [])]
 
     @property
-    def math_lockdown_domains(self) -> List[str]:
-        """获取数学挑战期间拦截的解题工具域名列表"""
+    def weak_network(self) -> Dict[str, Any]:
+        """获取弱网管控参数（命中黑名单时触发）"""
         with self._lock:
             rules = self._config.get("browser_rules", {})
-            return [str(d).lower().strip() for d in rules.get("math_lockdown_domains", [])]
+            wn = rules.get("weak_network", {}) or {}
+            return {
+                "enabled": bool(wn.get("enabled", False)),
+                "delay_ms": int(wn.get("delay_ms", 3000)),
+                "latency_ms": int(wn.get("latency_ms", 800)),
+                "download_kbps": int(wn.get("download_kbps", 128)),
+                "upload_kbps": int(wn.get("upload_kbps", 64)),
+                "min_duration": float(wn.get("min_duration", 15)),
+            }

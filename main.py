@@ -1,3 +1,4 @@
+
 """
 AOTE 管控系统 - 主程序入口（纯浏览器内容管控架构）
 
@@ -59,10 +60,16 @@ try:
 except Exception:
     pass
 
+# 控制台 UTF-8 输出（Windows GBK 控制台打印 emoji 会 UnicodeEncodeError 崩溃）
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 from aote.config import ConfigManager
 from aote.logger import AOTELogger
 from aote.time_guard import TimeGuard
-from aote.math_challenge import MathChallengeWindow
 from aote.usb_guard import USBGuard, USBModeSelector
 from aote.anti_tamper import AntiTamper
 from aote.http_server import AOTEHTTPServer
@@ -71,7 +78,6 @@ from aote.browser_sandbox import (
     BrowserSandbox,
     MODE_RELAXED,
     MODE_STRICT,
-    MODE_MATH_LOCKDOWN,
 )
 
 
@@ -94,8 +100,6 @@ class GuardianApp:
 
         # 控制
         self._shutdown = threading.Event()
-        self._math_active_lock = threading.Lock()
-        self._math_active = False
 
     # ============ 初始化 ============
     def init(self):
@@ -143,7 +147,6 @@ class GuardianApp:
             self.config, self.logger, self.time_guard, self.browser_sandbox
         )
         self.system_tray.on_emergency_exit_request = self._tray_emergency_exit
-        self.system_tray.on_show_math_challenge = self._show_math_challenge_from_tray
 
         # 注册紧急热键 Ctrl+Shift+Alt+G
         self._register_hotkey()
@@ -184,46 +187,19 @@ class GuardianApp:
 
     # ============ 浏览器内容违规回调 ============
     def _on_browser_violation(self, url: str, reason: str, level: int = 1):
-        """浏览器内检测到违禁内容 -> 触发数学挑战（宽松模式下仅记录）"""
+        """浏览器内检测到违禁内容 -> 记录违规日志并确认弱网已切换。
+        黑名单命中后沙盒已自动切换弱网；用户可按热键（密码验证）豁免。"""
         self.logger.warning(f"[管控] 浏览器违规: {url} reason={reason} level={level}")
         if self.browser_sandbox is not None:
             self.logger.log_browser_intercept(url, reason, self.browser_sandbox.current_mode())
-
-        # 宽松模式（上课时间）不弹数学挑战
-        if self.time_guard.is_relaxed_mode:
-            return
-
-        # 数学挑战进行中则跳过；仅对真实违规触发
-        with self._math_active_lock:
-            if self._math_active:
-                return
-            self._math_active = True
-        try:
-            self._show_math_challenge_sync(level=1)
-        finally:
-            with self._math_active_lock:
-                self._math_active = False
-
-    def _show_math_challenge_sync(self, level: int = 1):
-        """同步显示数学挑战（阻塞直到答对或被关闭）"""
-        def _on_success(unlock_seconds: int):
-            self.logger.info(f"[Math] 答题成功，浏览器临时解锁 {unlock_seconds} 秒")
-            if self.browser_sandbox is not None:
-                self.browser_sandbox.temporary_unlock(unlock_seconds)
-
-        window = MathChallengeWindow(
-            self.config, self.logger, self.browser_sandbox, _on_success
-        )
-        window.show_and_wait(level=level)
-
-    def _show_math_challenge_from_tray(self):
-        """托盘菜单触发（异步）"""
-        threading.Thread(
-            target=self._show_math_challenge_sync,
-            args=(1,),
-            daemon=True,
-            name="TrayMathChallenge"
-        ).start()
+            wn = self.browser_sandbox.weak_network_status()
+            if wn.get("active"):
+                self.logger.warning(
+                    f"[管控] 已自动切换弱网: {wn.get('host')} "
+                    f"(延迟 {wn.get('latency_ms')}ms / "
+                    f"下载 {wn.get('download_kbps')}KB/s / "
+                    f"上传 {wn.get('upload_kbps')}KB/s)"
+                )
 
     # ============ U盘回调 ============
     def _on_authorized_usb(self) -> Optional[str]:
@@ -319,7 +295,7 @@ class GuardianApp:
         self.http_server.start()
         self.usb_guard.start()
         self.system_tray.start()
-        # 浏览器控制沙盒（独立 Chromium）；失败不影响主控核心功能
+        # 浏览器控制沙盒（独立浏览器 / CDP 接管外部浏览器）；失败不影响主控核心功能
         if self.browser_sandbox is not None:
             try:
                 self.browser_sandbox.start()
@@ -347,7 +323,7 @@ class GuardianApp:
         """停止所有组件并清理"""
         self.logger.info("🛑 正在关闭系统...")
         try:
-            # 先关闭浏览器沙盒，释放独立 Chromium 进程
+            # 先关闭浏览器沙盒（CDP 模式仅断开连接，外部浏览器保持运行）
             if self.browser_sandbox:
                 try:
                     self.browser_sandbox.stop()

@@ -109,16 +109,19 @@ class AOTELogger:
         if self.logger.handlers:
             return
 
+        # 始终添加控制台输出（INFO 级），方便直接观察运行日志
+        stream_fmt = logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(stream_fmt)
+        stream_handler.setLevel(logging.INFO)
+        self.logger.addHandler(stream_handler)
+
         if self.log_dir is None:
             # 所有磁盘路径均不可用：仅控制台输出，保证日志模块绝不崩溃主程序
-            stream_handler = logging.StreamHandler()
-            stream_fmt = logging.Formatter(
-                "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S"
-            )
-            stream_handler.setFormatter(stream_fmt)
             stream_handler.setLevel(logging.DEBUG)
-            self.logger.addHandler(stream_handler)
             import sys
             print(f"[AOTELogger] {self._fallback_reason}", file=sys.stderr, flush=True)
             self.logger.warning(self._fallback_reason)
@@ -250,18 +253,17 @@ class AOTELogger:
                         url=url,
                         seconds=seconds)
 
-    def log_math_attempt(self, question: str, user_answer: str,
-                         correct_answer: str, is_correct: bool,
-                         duration_seconds: float, level: int = 1):
-        """数学挑战尝试日志"""
-        self._log_event("MATH_CHALLENGE", "INFO",
-                        f"数学挑战: {'正确' if is_correct else '错误'}",
-                        level=level,
-                        question=question,
-                        user_answer=user_answer,
-                        correct_answer=correct_answer if not is_correct else "***",
-                        is_correct=is_correct,
-                        duration_seconds=round(duration_seconds, 2))
+    def log_weak_network(self, action: str, host: str = "",
+                         latency_ms: int = 0, download_kbps: int = 0,
+                         upload_kbps: int = 0):
+        """弱网切换日志：action 为 'activate'（命中黑名单切换弱网）或 'restore'（恢复网络）"""
+        self._log_event("WEAK_NETWORK", "WARNING" if action == "activate" else "INFO",
+                        f"弱网管控: {action} {host}".strip(),
+                        action=action,
+                        host=host,
+                        latency_ms=latency_ms,
+                        download_kbps=download_kbps,
+                        upload_kbps=upload_kbps)
 
     def log_usb_event(self, event_type: str, drive_letter: str,
                       hardware_id: str = "", is_authorized: bool = False):

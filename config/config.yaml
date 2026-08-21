@@ -29,7 +29,7 @@ schedule:
 
 # 浏览器内容管控规则（基于域名，无需操作系统进程操作）
 browser_rules:
-  # 严格模式下拦截的娱乐/游戏域名（访问即触发数学挑战）
+  # 严格模式下拦截的娱乐/游戏域名（访问即拦截并自动切换弱网）
   block_domains:
     - "bilibili.com"
     - "youtube.com"
@@ -51,33 +51,23 @@ browser_rules:
     - "bing.com"
     - "qq.com"
     - "alipay.com"
-  # 数学挑战期间拦截的解题工具域名
-  math_lockdown_domains:
-    - "mathway.com"
-    - "wolframalpha.com"
-    - "symbolab.com"
-    - "photomath.com"
-    - "desmos.com"
-    - "calculator.net"
-    - "mathpapa.com"
-    - "cymath.com"
-    - "quickmath.com"
   # 自定义拦截页 HTML（留空使用内置默认页）
   blocked_page_html: ""
-  math_lockdown_page_html: ""
-
-# 数学挑战配置
-math_challenge:
-  level_1_reward_seconds: 300   # 难度一：5分钟
-  level_2_reward_seconds: 600   # 难度二：10分钟
-  question_timeout: 120         # 每题倒计时秒数，超时自动换题
-  # 题目参数：四位数运算，结果必须是10位数
-  question_params:
-    min_number: 1000
-    max_number: 9999
-    result_min: 1000000000
-    result_max: 9999999999
-    operations: ["+", "-", "*", "/"]
+  # 非上课时间（严格模式）是否全面禁止视频播放：
+  # 双管齐下——JS 层禁用播放逻辑 + 网络层拦截视频资源请求，
+  # 无论访问什么网站（含学习站点内嵌视频）都无法播放。
+  video_block_enabled: true
+  # 弱网管控（命中黑名单即时切换，不影响非黑名单网站）：
+  # 访问黑名单域名/URL 时，该页面立即限速为弱网（CDP 模拟延迟 + 限速），
+  # 且每个命中黑名单的请求额外附加 delay_ms 延迟；离开黑名单站点超
+  # min_duration 秒后自动恢复网络。
+  weak_network:
+    enabled: true              # 是否启用弱网管控
+    delay_ms: 3000             # 命中黑名单的每个请求附加延迟（毫秒）
+    latency_ms: 800            # CDP 模拟网络延迟（毫秒）
+    download_kbps: 128         # 下载限速（KB/s）
+    upload_kbps: 64            # 上传限速（KB/s）
+    min_duration: 15           # 弱网最短持续时间（秒），防止频繁抖动
 
 # U盘授权配置
 usb_guard:
@@ -110,14 +100,40 @@ logging:
   path: "C:\\ProgramData\\ClassroomGuard\\logs"
   retention_days: 30
 
-# 浏览器控制沙盒（Playwright）：在独立 Chromium 实例内直接管控浏览器内容
+# 浏览器控制沙盒（Playwright）：在独立浏览器实例内直接管控浏览器内容
 browser_sandbox:
   enabled: true                # 是否随主进程自动启动
   headless: false              # false=有头模式（可观察控制过程）；true=无头后台
+  # 本地浏览器适配（无需下载 Playwright 自带 Chromium）：
+  #   "auto"  = 自动探测本机 Edge/Chrome 并直接复用（推荐，无需下载任何浏览器）
+  #   "msedge"= 使用系统已安装的 Microsoft Edge
+  #   "chrome"= 使用系统已安装的 Google Chrome
+  #   ""      = 使用 Playwright 自带 Chromium（需先执行 python -m playwright install chromium）
+  browser_channel: "auto"
+  # 直接指定浏览器可执行文件完整路径（优先级最高，兼容任意 Chromium 内核浏览器，
+  # 如 360/QQ 极速版等），留空表示不指定。示例：
+  # executable_path: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+  executable_path: ""
+  # CDP 连接模式（调试推荐）：非空时不再自行启动浏览器，而是接管已打开的浏览器。
+  # 留空 "" = 自主启动浏览器模式（与之前行为一致）。
+  connect_cdp_url: "http://127.0.0.1:9222"
+  # ===== 全入口接管（无论通过何种方式打开浏览器，都纳入 CDP 管控）=====
+  # 浏览器必须带调试端口才能被 CDP 接管，而用户从任务栏/开始菜单/热搜等入口
+  # 打开的普通浏览器默认不带。AOTE 通过以下机制实现"任何入口都受管"：
+  #   1) monitor_browser_processes: 持续监控系统内浏览器进程，凡不带调试参数的
+  #      浏览器进程一律终止接管（最兜底的一环，请保持开启）；
+  #   2) auto_spawn_browser: CDP 连接超时后自动拉起受管浏览器（无需用户双击
+  #      专用快捷方式），配合 profile 单实例机制，后续从任意入口打开的
+  #      浏览器请求都会转发到该受管实例；
+  #   3) 可选辅助脚本 scripts/hijack_browser_entries.ps1：把桌面/开始菜单/任务栏
+  #      快捷方式及 http/https 链接关联统一改为带调试端口启动（需管理员手动执行，
+  #      支持 -Revert 还原）。
+  monitor_browser_processes: true
+  auto_spawn_browser: true
   user_data_dir: ""            # 独立用户数据目录，留空= %LOCALAPPDATA%\AOTE\chromium_profile（不污染主浏览器）
   default_url: "about:blank"   # 启动后默认打开的页面
   max_captured: 1000           # 响应捕获缓冲上限
-  # 自定义 Chromium 启动参数（覆盖默认值，含 --disable-web-security /
+  # 自定义浏览器启动参数（覆盖默认值，含 --disable-web-security /
   # --proxy-server / --remote-debugging-port；--user-data-dir 始终自动追加）
   launch_args: []
 

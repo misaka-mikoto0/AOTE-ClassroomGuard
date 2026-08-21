@@ -2,8 +2,8 @@
 AOTE 管控系统 - 本地HTTP服务（浏览器内容管控上报）
 端点：
   GET  /ping    存活检查
-  GET  /status  查询当前管控状态
-  POST /kill    上报浏览器内违禁内容（触发数学挑战 / 记录拦截）
+  GET  /status  查询当前管控状态（含弱网状态）
+  POST /kill    上报浏览器内违禁内容（记录拦截 + 即时封禁域名 + 自动弱网）
 监听 127.0.0.1:8765，仅接受本地连接
 """
 import threading
@@ -59,10 +59,11 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/ping"):
             self._send_json(200, {"alive": True, "timestamp": int(time.time())})
         elif self.path.startswith("/status"):
-            # 调试：查询当前状态
+            # 调试：查询当前状态（含弱网）
             mode = "unknown"
             unlocked = False
             sandbox_running = False
+            weak_network = {}
             try:
                 sb = self.server_browser_sandbox
                 if sb is not None:
@@ -70,12 +71,14 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
                     if sandbox_running:
                         mode = sb.current_mode()
                         unlocked = sb.is_unlocked()
+                        weak_network = sb.weak_network_status()
             except Exception:
                 pass
             self._send_json(200, {
                 "mode": mode,
                 "unlocked": unlocked,
                 "sandbox_running": sandbox_running,
+                "weak_network": weak_network,
             })
         else:
             self._send_json(404, {"error": "not_found"})
@@ -97,7 +100,7 @@ class AOTEHTTPHandler(BaseHTTPRequestHandler):
                 if self.server_logger:
                     self.server_logger.log_browser_intercept(url, reason, "report")
 
-                # 浏览器内容管控：交由 Orchestrator 处理（触发数学挑战等）
+                # 浏览器内容管控：交由 Orchestrator 记录违规（弱网由沙盒自动切换）
                 if self.server_on_violation:
                     try:
                         self.server_on_violation(url, reason, level)
@@ -137,7 +140,7 @@ class AOTEHTTPServer:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
-        # 违规上报回调（由主程序注入：触发数学挑战等）
+        # 违规上报回调（由主程序注入：记录违规日志等）
         self._on_violation: Optional[Callable[[str, str, int], None]] = None
 
     def set_on_violation(self, cb: Callable[[str, str, int], None]):

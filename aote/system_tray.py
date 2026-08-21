@@ -30,7 +30,6 @@ class SystemTray:
 
         # 菜单回调
         self.on_emergency_exit_request: Optional[Callable[[], None]] = None
-        self.on_show_math_challenge: Optional[Callable[[], None]] = None
 
     # ============ 图标生成 ============
     def _generate_icon_image(self):
@@ -111,11 +110,6 @@ class SystemTray:
             except Exception as e:
                 self.logger.debug(f"[Tray] 浏览器临时解锁失败: {e}")
 
-    def _menu_math_challenge(self, *args):
-        """显示数学挑战"""
-        if self.on_show_math_challenge:
-            threading.Thread(target=self.on_show_math_challenge, daemon=True).start()
-
     def _menu_status(self, *args):
         """显示当前状态（弹消息）"""
         mode_cn = {
@@ -130,9 +124,24 @@ class SystemTray:
         except Exception:
             sandbox_mode, unlocked = "未知", False
         unlock_status = "已解锁" if unlocked else "管控中"
+        # 弱网状态
+        weak_txt = "未启用"
+        try:
+            wn = self.browser_sandbox.weak_network_status() if self.browser_sandbox else {}
+            if wn.get("enabled"):
+                if wn.get("active"):
+                    weak_txt = (f"已生效 → {wn.get('host')} "
+                                f"(延迟 {wn.get('latency_ms')}ms / "
+                                f"下载 {wn.get('download_kbps')}KB/s)")
+                else:
+                    weak_txt = "监控中（未触发）"
+        except Exception:
+            weak_txt = "未知"
         msg = (f"AOTE 实力主义一体机管控系统\n\n"
                f"当前模式: {mode}\n"
-               f"浏览器: {sandbox_mode} ({unlock_status})")
+               f"浏览器: {sandbox_mode} ({unlock_status})\n"
+               f"弱网管控: {weak_txt}\n"
+               f"豁免方式: 按热键输入管理员密码")
         try:
             import tkinter as tk
             from tkinter import messagebox
@@ -181,7 +190,12 @@ class SystemTray:
             except Exception:
                 unlocked = False
             unlock = "✓已解锁" if unlocked else "✗管控中"
-            return f"{mode} {unlock}"
+            try:
+                wn = self.browser_sandbox.weak_network_status() if self.browser_sandbox else {}
+                weak = " ⚠弱网" if wn.get("active") else ""
+            except Exception:
+                weak = ""
+            return f"{mode} {unlock}{weak}"
 
         # 构建菜单
         menu = Menu(
@@ -192,7 +206,7 @@ class SystemTray:
             Menu.SEPARATOR,
             Item("⏱  临时解锁 5 分钟", self._menu_temp_unlock_5min),
             Item("⏱  临时解锁 30 分钟", self._menu_temp_unlock_30min),
-            Item("🧮 触发数学挑战", self._menu_math_challenge),
+            Item("🔑 密码豁免（热键验证）", self._menu_emergency_exit),
             Menu.SEPARATOR,
             Item("🚪 紧急退出系统...", self._menu_emergency_exit),
         )

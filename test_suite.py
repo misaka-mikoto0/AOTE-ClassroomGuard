@@ -1,9 +1,10 @@
 """
 AOTE 管控系统 - 快速测试脚本
 重点验证：
-1. 数学题生成（四位数运算，结果10位数）
-2. 配置加载
-3. 模块可导入性
+1. 配置加载（含弱网管控参数）
+2. 日志模块
+3. 弱网管控逻辑（域名匹配 / 弱网状态 / 参数调整）
+4. 时间调度逻辑
 """
 import os
 import sys
@@ -31,13 +32,12 @@ def test_config():
         assert len(blocks) > 0, "拦截域名列表为空"
         allowed = cfg.browser_allowed_domains
         print(f"  ✔ 白名单域名数量: {len(allowed)}")
-        math_targets = cfg.math_lockdown_domains
-        print(f"  ✔ 数学挑战拦截域名数量: {len(math_targets)}")
-        print(f"    -> {math_targets[:8]}..." if len(math_targets) > 8 else f"    -> {math_targets}")
-        params = cfg.get("math_challenge.question_params", {})
-        print(f"  ✔ 数学题参数: 数字范围 [{params['min_number']}, {params['max_number']}]")
-        print(f"            结果范围 [{params['result_min']}, {params['result_max']}]")
-        print(f"            运算: {params['operations']}")
+        # 弱网管控配置
+        wn = cfg.weak_network
+        print(f"  ✔ 弱网管控配置: enabled={wn['enabled']} "
+              f"delay={wn['delay_ms']}ms latency={wn['latency_ms']}ms "
+              f"download={wn['download_kbps']}KB/s upload={wn['upload_kbps']}KB/s")
+        assert "delay_ms" in wn and "download_kbps" in wn, "弱网配置缺少关键字段"
         print("  ✔ 配置加载通过")
         return True
     except AssertionError as e:
@@ -59,8 +59,8 @@ def test_logger():
         log.info("测试消息 - info")
         log.warning("测试消息 - warning")
         log.log_mode_change("strict", "relaxed", "test")
-        log.log_math_attempt("1+1=?", "2", "2", True, 5.0, 1)
         log.log_usb_event("insert", "E:\\", "ABC123", True)
+        log.log_browser_intercept("https://www.bilibili.com/video/1", "blocked_domain", "strict")
         print("  ✔ 日志模块通过（检查logs/目录）")
         return True
     except Exception as e:
@@ -70,65 +70,78 @@ def test_logger():
         return False
 
 
-def test_math_question_generator():
+def test_weak_network_logic():
     """
-    核心用户需求测试：
-    - 所有运算数必须是四位数（1000-9999）
-    - 结果必须是10位数（1,000,000,000 ~ 9,999,999,999）
+    弱网管控核心逻辑测试（不启动浏览器）：
+    - 弱网状态接口返回完整字段
+    - 参数可动态调整
+    - 黑名单域名匹配正确
     """
     print("\n" + "=" * 60)
-    print("[3/4] 测试数学题目生成（核心需求！）")
+    print("[3/4] 测试弱网管控逻辑（核心需求！）")
     print("  要求：")
-    print("    ① 运算数 = 四位数 [1000, 9999]")
-    print("    ② 结果 = 十位数 [1,000,000,000, 9,999,999,999]")
+    print("    ① 命中黑名单域名即时切换弱网（状态可见）")
+    print("    ② 弱网参数可动态调整")
+    print("    ③ 域名匹配支持 example.com 与 *.example.com")
     try:
         from aote.config import ConfigManager
-        from aote.math_challenge import QuestionGenerator
+        from aote.logger import AOTELogger
+        from aote.browser_sandbox import BrowserSandbox
 
         cfg = ConfigManager()
-        gen = QuestionGenerator(cfg)
-        params = cfg.get("math_challenge.question_params", {})
-        min_n = params.get("min_number", 1000)
-        max_n = params.get("max_number", 9999)
-        min_r = params.get("result_min", 1_000_000_000)
-        max_r = params.get("result_max", 9_999_999_999)
+        log = AOTELogger(log_path=os.path.join(BASE_DIR, "logs"))
+        sandbox = BrowserSandbox(cfg, log)
 
-        total_tests = 100
-        pass_count = 0
-        error_details = []
+        # ① 弱网状态接口
+        status = sandbox.weak_network_status()
+        for key in ("enabled", "active", "delay_ms", "latency_ms",
+                    "download_kbps", "upload_kbps", "since", "host"):
+            assert key in status, f"弱网状态缺少字段: {key}"
+        print(f"  ✔ 弱网状态接口完整: {status}")
+        assert "delay_ms" in status and status["delay_ms"] >= 0
 
-        for level in (1, 2):
-            print(f"\n  --- 难度 {level}（每题解锁 {cfg.get(f'math_challenge.level_{level}_reward_seconds')//60} 分钟） ---")
-            for i in range(total_tests // 2):
-                q = gen.generate_question(level)
-                # 验证结果范围
-                is_10digit = min_r <= q.answer <= max_r
-                # 验证题目中所有数字（简单正则提取）
-                import re
-                nums = [int(x) for x in re.findall(r"\b\d{4,}\b", q.text)]
-                all_4digit = all(min_n <= n <= max_n for n in nums)
+        # ② 弱网配置已同步到沙盒（enabled / 各参数与 config 一致）
+        wn_cfg = cfg.weak_network
+        assert sandbox._weak_network_enabled == wn_cfg["enabled"], "弱网开关未同步到沙盒"
+        assert sandbox._weak_network_delay_ms == wn_cfg["delay_ms"], "弱网延迟参数未同步"
+        assert sandbox._weak_network_latency_ms == wn_cfg["latency_ms"], "弱网延迟参数未同步"
+        assert sandbox._weak_network_download_kbps == wn_cfg["download_kbps"], "下载限速未同步"
+        assert sandbox._weak_network_upload_kbps == wn_cfg["upload_kbps"], "上传限速未同步"
+        print(f"  ✔ 弱网配置已同步到沙盒（enabled={sandbox._weak_network_enabled}, "
+              f"delay={sandbox._weak_network_delay_ms}ms, "
+              f"dl={sandbox._weak_network_download_kbps}KB/s, "
+              f"ul={sandbox._weak_network_upload_kbps}KB/s）")
 
-                status = "✓" if (is_10digit and all_4digit) else "✗"
-                if status == "✓":
-                    pass_count += 1
-                else:
-                    error_details.append(
-                        f"  L{level} #{i}: {q.text} -> {q.answer} "
-                        f"(nums_ok={all_4digit}, result_ok={is_10digit})"
-                    )
+        # ③ 动态调整弱网参数
+        sandbox.set_weak_network_params(delay_ms=1500, download_kbps=64, upload_kbps=32)
+        status2 = sandbox.weak_network_status()
+        assert status2["delay_ms"] == 1500, "delay_ms 更新失败"
+        assert status2["download_kbps"] == 64, "download_kbps 更新失败"
+        assert status2["upload_kbps"] == 32, "upload_kbps 更新失败"
+        print(f"  ✔ 弱网参数动态调整生效: delay={status2['delay_ms']}ms "
+              f"dl={status2['download_kbps']}KB/s ul={status2['upload_kbps']}KB/s")
 
-                # 展示前3题
-                if i < 3:
-                    print(f"    {status} 题目: {q.text}")
-                    print(f"       答案: {q.answer} (10位数={is_10digit}, 四位数运算数={all_4digit})")
+        # ④ 域名匹配（黑名单命中判定）
+        # 语义：'example.com' 与 '*.example.com' 均覆盖 裸域+所有子域（宽松匹配，对拦截更安全）
+        matches = [
+            ("https://www.bilibili.com/video/av1", ["bilibili.com", "youtube.com"], True),
+            ("https://bilibili.com", ["bilibili.com"], True),
+            ("https://sub.video.youtube.com/watch", ["*.youtube.com"], True),
+            ("https://youtube.com", ["*.youtube.com"], True),      # 通配符同样覆盖裸域
+            ("https://www.baidu.com", ["bilibili.com", "youtube.com"], False),
+            ("https://edu.cn/lesson", ["edu.cn"], True),
+            ("http://evil.evil.com/x", ["*.youtube.com"], False),  # 完全无关域名不误伤
+        ]
+        for url, patterns, expect in matches:
+            from urllib.parse import urlparse
+            host = (urlparse(url).hostname or "").lower()
+            got = sandbox._domain_match(host, patterns)
+            assert got == expect, f"匹配错误: {url} vs {patterns} -> {got} (期望 {expect})"
+        print("  ✔ 域名匹配正确（含通配符 *.example.com）")
 
-        print(f"\n  通过率: {pass_count}/{total_tests} = {pass_count*100//total_tests}%")
-        if error_details:
-            print(f"  失败样例（前5条）:")
-            for e in error_details[:5]:
-                print(e)
-        assert pass_count == total_tests, f"有 {total_tests - pass_count} 题不满足要求"
-        print("  ✔ 数学题生成通过（所有题均满足：四位数运算 + 结果10位数）")
+        # 说明：弱网触发（active=True）依赖真实浏览器请求，由 _route_handler
+        # 持续监控并在命中黑名单时自动切换，此处通过状态接口与参数接口验证逻辑正确。
+        print("  ✔ 弱网管控逻辑通过")
         return True
     except AssertionError as e:
         print(f"  ✗ 断言失败: {e}")
@@ -140,7 +153,7 @@ def test_math_question_generator():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        print(f"  ✗ 数学题生成失败: {e}")
+        print(f"  ✗ 弱网管控逻辑失败: {e}")
         return False
 
 
@@ -184,7 +197,7 @@ def main():
     results = []
     results.append(("配置加载", test_config()))
     results.append(("日志模块", test_logger()))
-    results.append(("数学题生成", test_math_question_generator()))
+    results.append(("弱网管控逻辑", test_weak_network_logic()))
     results.append(("时间调度逻辑", test_time_guard_logic()))
 
     print("\n" + "=" * 60)
@@ -205,9 +218,10 @@ def main():
         print("  python uninstall.py      # 清理数据文件")
         print()
         print("下一步:")
-        print("  1. 安装依赖: pip install -r requirements.txt && python -m playwright install chromium")
-        print("  2. 修改配置: config/config.yaml (密码、U盘白名单、浏览器规则等)")
-        print("  3. 启动: python main.py")
+        print("  1. 安装依赖: pip install -r requirements.txt  (默认复用本机 Edge/Chrome，无需下载浏览器)")
+        print("  2. 修改配置: config/config.yaml (密码、U盘白名单、弱网参数、浏览器规则等)")
+        print("  3. (可选)创建调试快捷方式: powershell -ExecutionPolicy Bypass -File scripts\\create_cdp_shortcut.ps1")
+        print("  4. 启动: python main.py")
     else:
         print("⚠ 部分测试失败，请根据以上错误排查。")
         print("  最常见原因是未安装依赖，请执行: pip install -r requirements.txt")
