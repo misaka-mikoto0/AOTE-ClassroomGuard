@@ -87,7 +87,7 @@ class AntiTamper:
 
     # ============ 监控循环（浏览器沙盒心跳） ============
     def _monitor_loop(self):
-        interval = int(self.config.get("watchdog.monitor_interval", 2))
+        interval = int(self.config.get("anti_tamper.monitor_interval", 2))
         if interval <= 0:
             interval = 2
 

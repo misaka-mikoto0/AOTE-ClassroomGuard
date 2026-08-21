@@ -26,11 +26,13 @@ def test_config():
     try:
         from aote.config import ConfigManager
         cfg = ConfigManager()
-        targets = cfg.all_target_processes
-        print(f"  ✔ 目标进程数量: {len(targets)}")
-        assert len(targets) > 0, "目标进程为空"
-        math_targets = cfg.math_lockdown_processes
-        print(f"  ✔ 数学题冻结进程数量: {len(math_targets)}")
+        blocks = cfg.browser_block_domains
+        print(f"  ✔ 拦截域名数量: {len(blocks)}")
+        assert len(blocks) > 0, "拦截域名列表为空"
+        allowed = cfg.browser_allowed_domains
+        print(f"  ✔ 白名单域名数量: {len(allowed)}")
+        math_targets = cfg.math_lockdown_domains
+        print(f"  ✔ 数学挑战拦截域名数量: {len(math_targets)}")
         print(f"    -> {math_targets[:8]}..." if len(math_targets) > 8 else f"    -> {math_targets}")
         params = cfg.get("math_challenge.question_params", {})
         print(f"  ✔ 数学题参数: 数字范围 [{params['min_number']}, {params['max_number']}]")
@@ -198,15 +200,14 @@ def main():
     if all_pass:
         print("🎉 所有测试通过！系统已就绪。")
         print()
-        print("启动方式:")
-        print("  python main.py           # 主进程（带UI + 守护子进程）")
-        print("  python main.py --watchdog   # 仅守护进程模式")
-        print("  python uninstall.py      # 完整卸载清理")
+        print("启动方式（单进程，纯浏览器内容管控）:")
+        print("  python main.py           # 启动主进程 + 浏览器沙盒")
+        print("  python uninstall.py      # 清理数据文件")
         print()
         print("下一步:")
-        print("  1. 安装依赖: pip install -r requirements.txt")
-        print("  2. 修改配置: config/config.yaml (密码、U盘白名单等)")
-        print("  3. 管理员运行: python main.py")
+        print("  1. 安装依赖: pip install -r requirements.txt && python -m playwright install chromium")
+        print("  2. 修改配置: config/config.yaml (密码、U盘白名单、浏览器规则等)")
+        print("  3. 启动: python main.py")
     else:
         print("⚠ 部分测试失败，请根据以上错误排查。")
         print("  最常见原因是未安装依赖，请执行: pip install -r requirements.txt")

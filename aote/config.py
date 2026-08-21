@@ -140,7 +140,7 @@ class ConfigManager:
             "http_server": {
                 "host": "127.0.0.1",
                 "port": 8765,
-                "extension_heartbeat_timeout": 30
+                "heartbeat_timeout": 30
             }
         }
 

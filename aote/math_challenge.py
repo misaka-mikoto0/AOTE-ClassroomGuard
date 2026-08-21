@@ -208,7 +208,7 @@ class MathChallengeWindow:
     """
     数学挑战GUI窗口
     - 置顶显示，不可关闭
-    - 显示期间冻结计算器、浏览器等工具
+    - 显示期间通过浏览器沙盒拦截解题工具网站
     """
 
     def __init__(self, config: ConfigManager, logger: AOTELogger,

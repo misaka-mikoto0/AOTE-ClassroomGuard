@@ -101,6 +101,10 @@ emergency:
   # SHA-256 hash of "Admin@123" (需要管理员修改)
   admin_password_hash: "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
 
+# 防绕过模块配置（浏览器沙盒心跳监控）
+anti_tamper:
+  monitor_interval: 2     # 心跳检查间隔（秒）
+
 # 日志配置
 logging:
   path: "C:\\ProgramData\\ClassroomGuard\\logs"
