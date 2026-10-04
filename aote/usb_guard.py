@@ -5,7 +5,6 @@ AOTE 管控系统 - U盘授权解锁模块（USB Guard）
 - 双因素认证：硬件ID + 密钥文件SHA-256哈希
 - 三种解锁模式：即拔即禁、定时解锁、永久解锁
 """
-import os
 import sys
 import ctypes
 import time
@@ -14,38 +13,44 @@ import hashlib
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import Dict, List, Optional, Set, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable
 from pathlib import Path
 from ctypes import wintypes
 
 from .config import ConfigManager
 from .logger import AOTELogger
+# 复用 AntiTamper 的哈希与回文匹配算法，保证 USB 维护模式密码与紧急退出密码始终一致
+from .anti_tamper import password_matches_hash, sha256_str
 
+# 可移动磁盘类型（Windows GetDriveTypeW 返回值）
+DRIVE_REMOVABLE = 2
 
-# ============== Windows API & 常量 ==============
-if sys.platform == "win32":
-    DRIVE_REMOVABLE = 2
-    DRIVE_CDROM = 5
+# 模式选择窗口配色
+_WINDOW_BG = "#006644"
+_WINDOW_SUB_FG = "#ccffee"
+_CARD_BG = "#f0fff0"
+_PERM_CARD_BG = "#fff0e0"
+_BTN_BLUE = "#0078d7"
+_BTN_ORANGE = "#d07000"
 
-    # WM_DEVICECHANGE
-    WM_DEVICECHANGE = 0x0219
-    DBT_DEVICEARRIVAL = 0x8000
-    DBT_DEVICEREMOVECOMPLETE = 0x8004
-    DBT_DEVTYP_VOLUME = 0x00000002
+# 窗口字体
+_TITLE_FONT = ("Microsoft YaHei", 18, "bold")
+_DESC_FONT = ("Microsoft YaHei", 10)
+_CARD_TITLE_FONT = ("Microsoft YaHei", 12, "bold")
+_CARD_DETAIL_FONT = ("Microsoft YaHei", 10)
+_CARD_BTN_FONT = ("Microsoft YaHei", 11, "bold")
+
+# 密钥文件读取缓冲区大小（字节）
+_HASH_CHUNK_SIZE = 8192
 
 
 def _sha256_file(filepath: str) -> str:
-    """计算文件SHA-256哈希"""
+    """计算文件SHA-256哈希（分块读取，避免大文件占用内存）"""
     h = hashlib.sha256()
     with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(_HASH_CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _sha256_str(text: str) -> str:
-    """计算字符串SHA-256哈希"""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class USBGuard:
@@ -86,19 +91,7 @@ class USBGuard:
         expected = self.config.get("emergency.admin_password_hash", "").lower()
         if not expected:
             return False
-        n = len(password)
-        if _sha256_str(password).lower() == expected:
-            return True
-        MIN_SUBSTR_LEN = 8
-        for i in range(n):
-            max_j = min(n, i + max(n, 100))
-            for j in range(max(i + MIN_SUBSTR_LEN, i + 1), max_j + 1):
-                substr = password[i:j]
-                if len(substr) < MIN_SUBSTR_LEN:
-                    continue
-                if _sha256_str(substr).lower() == expected:
-                    return True
-        return False
+        return password_matches_hash(password, expected)
 
     # ============ 外部接口 ============
     def set_on_authorized_usb(self, cb: Callable[[], Optional[str]]):
@@ -116,17 +109,16 @@ class USBGuard:
     # ============ 盘符检测 ============
     def _get_removable_drives(self) -> List[str]:
         """获取当前所有可移动磁盘盘符"""
-        drives = []
+        drives: List[str] = []
         if sys.platform != "win32":
             return drives
         try:
-            # 使用 GetLogicalDrives
+            # 使用 GetLogicalDrives 位掩码枚举 A~Z
             bitmask = ctypes.windll.kernel32.GetLogicalDrives()
             for i, letter in enumerate(string.ascii_uppercase):
                 if bitmask & (1 << i):
                     drive = f"{letter}:\\"
-                    drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
-                    if drive_type == DRIVE_REMOVABLE:
+                    if ctypes.windll.kernel32.GetDriveTypeW(drive) == DRIVE_REMOVABLE:
                         drives.append(drive)
         except Exception as e:
             self.logger.debug(f"获取盘符列表失败: {e}")
@@ -197,14 +189,15 @@ class USBGuard:
     # ============ 处理插入/拔出 ============
     def _handle_drive_arrival(self, drive: str):
         """处理U盘插入"""
-        time.sleep(0.5)  # 等U盘挂载稳定
-        serial = self._get_volume_serial(drive)
+        # 挂载稳定等待时间从 time_settings.usb_mount_delay 读取（秒）
+        time.sleep(max(float(self.config.get("time_settings.usb_mount_delay", 0.5)), 0))
+        # 认证结果中已包含硬件ID，无需再次查询卷序列号
         is_authorized, hw_id = self.authenticate_usb(drive)
 
         self.logger.log_usb_event("insert", drive, hardware_id=hw_id, is_authorized=is_authorized)
 
         if is_authorized:
-            self._drives[drive] = (serial, True)
+            self._drives[drive] = (hw_id, True)
             # 弹出模式选择窗口
             mode = None
             if self._on_authorized_usb:
@@ -214,7 +207,7 @@ class USBGuard:
                 self._eject_mode_active = True
                 self._eject_mode_drive = drive
         else:
-            self._drives[drive] = (serial, False)
+            self._drives[drive] = (hw_id, False)
 
     def _handle_drive_removal(self, drive: str):
         """处理U盘拔出"""
@@ -227,9 +220,10 @@ class USBGuard:
         if self._eject_mode_active and self._eject_mode_drive == drive:
             self._eject_mode_active = False
             self._eject_mode_drive = None
-            self.logger.info("[USBGuard] 即拔即禁U盘已拔出，3秒内恢复严格模式")
-            # 3秒内恢复
-            threading.Timer(3.0, self._trigger_eject_unplug).start()
+            # 恢复严格模式延迟从 time_settings.usb_eject_restore_delay 读取（秒）
+            delay = max(float(self.config.get("time_settings.usb_eject_restore_delay", 3.0)), 0)
+            self.logger.info(f"[USBGuard] 即拔即禁U盘已拔出，{delay:.0f}秒内恢复严格模式")
+            threading.Timer(delay, self._trigger_eject_unplug).start()
 
     def _trigger_eject_unplug(self):
         if self._on_eject_mode_unplug:
@@ -241,10 +235,10 @@ class USBGuard:
     # ============ 轮询循环 ============
     def _poll_loop(self):
         """轮询检测U盘变化（间隔<=2秒）"""
-        initial = set(self._get_removable_drives())
+        known = set(self._get_removable_drives())
         # Major 7 修复：对启动时已存在的U盘执行一次认证检查，而不是永远不识别
         # 使用后台线程避免阻塞启动初期的其他轮询
-        for d in list(initial):
+        for d in known:
             if self._stop_event.is_set():
                 break
             try:
@@ -258,23 +252,19 @@ class USBGuard:
             except Exception as e:
                 self.logger.error(f"启动时U盘初始认证异常 {d}: {e}")
 
-        known = initial
-
         while not self._stop_event.is_set():
             try:
                 current = set(self._get_removable_drives())
 
                 # 新增
-                added = current - known
-                for d in added:
+                for d in current - known:
                     try:
                         self._handle_drive_arrival(d)
                     except Exception as e:
                         self.logger.error(f"处理U盘插入异常 {d}: {e}")
 
                 # 移除
-                removed = known - current
-                for d in removed:
+                for d in known - current:
                     try:
                         self._handle_drive_removal(d)
                     except Exception as e:
@@ -284,7 +274,9 @@ class USBGuard:
             except Exception as e:
                 self.logger.error(f"[USBGuard] 轮询异常: {e}")
 
-            self._stop_event.wait(1.5)
+            # 轮询间隔从 time_settings.usb_poll_interval 读取（秒）
+            interval = float(self.config.get("time_settings.usb_poll_interval", 1.5))
+            self._stop_event.wait(max(interval, 0.1))
 
     # ============ 生命周期 ============
     def start(self):
@@ -302,7 +294,8 @@ class USBGuard:
     def stop(self):
         self._stop_event.set()
         if self._poll_thread:
-            self._poll_thread.join(timeout=3)
+            timeout = float(self.config.get("time_settings.component_stop_timeout", 3))
+            self._poll_thread.join(timeout=max(timeout, 0.1))
         self.logger.info("[USBGuard] U盘监听模块已停止")
 
 
@@ -317,41 +310,36 @@ class USBModeSelector:
         self._thread: Optional[threading.Thread] = None
         self.root: Optional[tk.Tk] = None
 
+    # ---------- 窗口构建 ----------
     def _build_window(self):
         self.root = tk.Tk()
         self.root.title("U盘授权 - 解锁模式选择")
         self.root.attributes("-topmost", True)
+        # 居中显示
         w, h = 560, 460
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
+        x = (self.root.winfo_screenwidth() - w) // 2
+        y = (self.root.winfo_screenheight() - h) // 2
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.root.resizable(False, False)
-        self.root.configure(bg="#006644")
+        self.root.configure(bg=_WINDOW_BG)
 
-        title = tk.Label(
+        tk.Label(
             self.root,
             text="✅ 授权U盘已识别\n请选择解锁模式",
-            font=("Microsoft YaHei", 18, "bold"),
-            fg="white", bg="#006644",
+            font=_TITLE_FONT,
+            fg="white", bg=_WINDOW_BG,
             justify=tk.CENTER
-        )
-        title.pack(pady=(25, 10))
+        ).pack(pady=(25, 10))
 
-        desc = tk.Label(
+        tk.Label(
             self.root,
             text="选择解锁模式以临时禁用系统管控",
-            font=("Microsoft YaHei", 10),
-            fg="#ccffee", bg="#006644"
-        )
-        desc.pack(pady=(0, 20))
+            font=_DESC_FONT,
+            fg=_WINDOW_SUB_FG, bg=_WINDOW_BG
+        ).pack(pady=(0, 20))
 
         content = tk.Frame(self.root, bg="white", padx=20, pady=20)
         content.pack(fill=tk.BOTH, expand=True, padx=15)
-
-        modes = self.config.get("unlock_modes", [])
-        BTN_FONT = ("Microsoft YaHei", 12, "bold")
 
         self.selected_mode = None
 
@@ -363,7 +351,13 @@ class USBModeSelector:
                 self.selected_mode = mode_name
                 self._close()
 
-        for mode in modes:
+        self._build_mode_cards(content, _choose)
+        self._build_maintenance_card(content, _choose)
+        self._build_cancel_button()
+
+    def _build_mode_cards(self, content, choose: Callable[[str], None]):
+        """按配置生成各解锁模式卡片"""
+        for mode in self.config.get("unlock_modes", []):
             name = mode.get("name", "")
             mtype = mode.get("type", "")
             seconds = mode.get("seconds", 0)
@@ -371,62 +365,62 @@ class USBModeSelector:
             # 描述文字
             if mtype == "eject":
                 detail = "U盘拔出前保持解锁，拔出后3秒内恢复严格模式"
-                cmd = lambda: _choose(name)
             elif mtype == "timer":
                 detail = f"保持解锁 {seconds // 60} 分钟，到期自动恢复严格模式"
-                cmd = lambda n=name: _choose(n)
             else:
                 detail = ""
-                cmd = lambda n=name: _choose(n)
 
-            frame = tk.Frame(content, bg="#f0fff0", relief=tk.GROOVE, bd=1)
-            frame.pack(fill=tk.X, pady=6)
-            tk.Label(
-                frame, text=f"🔑  {name}",
-                font=BTN_FONT, fg="#003d29", bg="#f0fff0", anchor="w"
-            ).pack(fill=tk.X, padx=15, pady=(8, 0))
-            tk.Label(
-                frame, text=f"    {detail}",
-                font=("Microsoft YaHei", 10), fg="#557", bg="#f0fff0", anchor="w"
-            ).pack(fill=tk.X, padx=15, pady=(0, 8))
-            tk.Button(
-                frame, text=f"选择「{name}」",
-                font=("Microsoft YaHei", 11, "bold"),
-                bg="#0078d7", fg="white", relief=tk.FLAT,
-                padx=20, pady=6, cursor="hand2",
-                command=cmd
-            ).pack(padx=15, pady=(0, 10), anchor="e")
+            self._add_card(
+                content, icon="🔑", name=name, detail=detail,
+                bg=_CARD_BG, title_fg="#003d29", detail_fg="#557",
+                btn_text=f"选择「{name}」", btn_bg=_BTN_BLUE,
+                # 默认参数绑定，避免闭包捕获循环变量
+                command=lambda n=name: choose(n),
+            )
 
-        # 永久解锁（维护模式） - 单独添加
-        perm_frame = tk.Frame(content, bg="#fff0e0", relief=tk.GROOVE, bd=1)
-        perm_frame.pack(fill=tk.X, pady=6)
+    def _build_maintenance_card(self, content, choose: Callable[[str], None]):
+        """永久解锁（维护模式）卡片：需管理员密码二次确认"""
+        self._add_card(
+            content, icon="🛠", name="永久解锁（维护模式）",
+            detail="需输入管理员密码二次确认，解锁至下次重启或手动恢复",
+            bg=_PERM_CARD_BG, title_fg="#a05000", detail_fg="#775",
+            btn_text="进入维护模式", btn_bg=_BTN_ORANGE,
+            command=lambda: choose("永久解锁（维护模式）"),
+        )
+
+    def _add_card(self, parent, *, icon: str, name: str, detail: str,
+                  bg: str, title_fg: str, detail_fg: str,
+                  btn_text: str, btn_bg: str, command):
+        """在内容区添加一张模式卡片（标题 + 说明 + 选择按钮）"""
+        frame = tk.Frame(parent, bg=bg, relief=tk.GROOVE, bd=1)
+        frame.pack(fill=tk.X, pady=6)
         tk.Label(
-            perm_frame, text="🛠  永久解锁（维护模式）",
-            font=BTN_FONT, fg="#a05000", bg="#fff0e0", anchor="w"
+            frame, text=f"{icon}  {name}",
+            font=_CARD_TITLE_FONT, fg=title_fg, bg=bg, anchor="w"
         ).pack(fill=tk.X, padx=15, pady=(8, 0))
         tk.Label(
-            perm_frame, text="    需输入管理员密码二次确认，解锁至下次重启或手动恢复",
-            font=("Microsoft YaHei", 10), fg="#775", bg="#fff0e0", anchor="w"
+            frame, text=f"    {detail}",
+            font=_CARD_DETAIL_FONT, fg=detail_fg, bg=bg, anchor="w"
         ).pack(fill=tk.X, padx=15, pady=(0, 8))
         tk.Button(
-            perm_frame, text="进入维护模式",
-            font=("Microsoft YaHei", 11, "bold"),
-            bg="#d07000", fg="white", relief=tk.FLAT,
+            frame, text=btn_text,
+            font=_CARD_BTN_FONT, bg=btn_bg, fg="white", relief=tk.FLAT,
             padx=20, pady=6, cursor="hand2",
-            command=lambda: _choose("永久解锁（维护模式）")
+            command=command
         ).pack(padx=15, pady=(0, 10), anchor="e")
 
-        # 取消
-        cancel_frame = tk.Frame(self.root, bg="#006644")
+    def _build_cancel_button(self):
+        cancel_frame = tk.Frame(self.root, bg=_WINDOW_BG)
         cancel_frame.pack(fill=tk.X, pady=12)
         tk.Button(
             cancel_frame, text="取消",
-            font=("Microsoft YaHei", 11),
+            font=_DESC_FONT,
             bg="#ccc", fg="#333", relief=tk.FLAT,
             padx=25, pady=6, cursor="hand2",
             command=self._close
         ).pack()
 
+    # ---------- 密码验证 ----------
     def _ask_maintenance_password(self, mode_name: str):
         """维护模式二次验证密码（与 AntiTamper 密码一致）"""
         pwd = self._prompt_password()
@@ -443,7 +437,7 @@ class USBModeSelector:
         else:
             # 降级：直接哈希匹配（不建议，应通过 USBGuard.set_admin_verifier 注入）
             expected = self.config.get("emergency.admin_password_hash", "").lower()
-            actual = _sha256_str(pwd).lower()
+            actual = sha256_str(pwd).lower()
             ok = bool(expected and expected == actual)
         if not ok:
             messagebox.showerror("验证失败", "管理员密码错误！", parent=self.root)
@@ -453,7 +447,7 @@ class USBModeSelector:
         self._close()
 
     def _prompt_password(self) -> Optional[str]:
-        """弹出密码输入框"""
+        """弹出密码输入框（返回 None 表示用户取消）"""
         dlg = tk.Toplevel(self.root)
         dlg.title("管理员密码验证")
         dlg.geometry("360x180")
@@ -487,6 +481,7 @@ class USBModeSelector:
         self.root.wait_window(dlg)
         return result["value"]
 
+    # ---------- 生命周期 ----------
     def _close(self):
         try:
             if self.root:

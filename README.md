@@ -162,13 +162,25 @@
    powershell -ExecutionPolicy Bypass -File scripts\create_cdp_shortcut.ps1
    ```
 
+5. **（可选）接管任务栏/状态栏等所有启动入口**
+
+   想让学生**无论从任务栏固定图标、开始菜单还是点击网页链接**打开的 Edge 都自动带调试端口、纳入 CDP 管控，可执行：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\hijack_browser_entries.ps1
+   ```
+
+   它会：① 在 `HKCU\Software\Classes\MSEdgeHTM\shell\open\command` 写入带 `--remote-debugging-port=9222` 的 URL 关联命令（无需管理员权限，对当前用户生效）；② 给任务栏/开始菜单/桌面上固定的 Edge 快捷方式追加 CDP 参数。
+
+   还原方式：`...\hijack_browser_entries.ps1 -Revert`（原注册表值/快捷方式自动备份于 `%LOCALAPPDATA%\AOTE\`）。
+
 5. **运行测试**（可选，验证安装）
 
    ```powershell
    python test_suite.py
    ```
 
-> **注意**：默认使用本机已安装的 Edge/Chrome（`browser_channel: "auto"`），**无需**执行 `python -m playwright install chromium` 下载浏览器。仅当你把 `browser_channel` 改为 `""` 时才需要下载。
+> **注意**：系统**不再自动打开/拉起浏览器**，改为通过 CDP 接管用户手动打开的调试浏览器。直接复用本机已安装的 Edge/Chrome，**无需**执行 `python -m playwright install chromium` 下载浏览器。
 
 ---
 
@@ -183,14 +195,40 @@ python main.py
 启动后：
 - 系统托盘出现蓝色盾牌图标
 - 控制台与 `aote.log` 同步输出运行日志（含浏览器访问记录）
-- 按配置进入 CDP 接管模式或自主启动浏览器模式
+- 进入 CDP 接管模式，等待用户手动打开调试浏览器后接管（系统不自动打开浏览器）
 
 ### 命令行参数
 
 | 参数 | 说明 |
 |------|------|
 | `python main.py` | 标准模式（单进程，浏览器内容管控） |
+| `python main.py --install-autostart` | 设置开机自启动（写入 HKCU Run 键，无需管理员） |
+| `python main.py --remove-autostart` | 取消开机自启动 |
+| `python main.py --autostart-status` | 查询开机自启动状态 |
 | `python uninstall.py` | 卸载清理（仅删除本程序数据文件，不做任何系统修改） |
+
+> exe 版本同样支持以上参数，例如 `AOTE.exe --autostart-status`。
+
+### 打包为 exe 并设置开机自启动
+
+将项目打包为**单文件免 Python 环境**的可执行程序（Python 运行时、全部依赖、playwright 驱动、config 配置全部内嵌），并注册开机自启动：
+
+```powershell
+# 一键打包 + 设置开机自启动（产物: dist\AOTE.exe，约 62MB）
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -SetAutostart
+
+# 其他常用命令
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1            # 仅重新打包
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -NoBuild   # 跳过打包，仅处理自启动
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -RemoveAutostart      # 取消开机自启动
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -AutostartStatus      # 查询自启动状态
+```
+
+打包要点：
+- 使用 `aote.spec`（PyInstaller **onefile** 单文件模式，`console=False` 无窗口托盘应用），`collect_all("playwright")` 完整收集 playwright 驱动（`node.exe`），整个程序只需一个 exe 即可运行，无需安装 Python/playwright/浏览器下载
+- **配置内嵌 + 可覆盖**：`config\config.yaml` 已打进 exe；同时脚本会复制一份到 exe 旁的 `dist\config\`，exe 优先读取旁置配置（可编辑、热重载生效），删除旁置配置后自动回退到内嵌配置
+- 自启动项写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（值名 `AOTE_Guardian`），仅当前用户生效、无需管理员权限
+- 重打包时使用 `--clean` 清理旧产物；发布时只需拷贝 `dist\AOTE.exe` 一个文件
 
 ### 解锁方式
 
@@ -255,8 +293,7 @@ python main.py
 | 现象 | 原因与解决 |
 |------|-----------|
 | 日志一直提示"等待调试浏览器连接" | 没有双击调试快捷方式，或已有普通 Edge 在运行（Edge 会把调试参数转发给旧实例而忽略）。**先关闭所有普通 Edge，再双击调试快捷方式** |
-| 想回到程序自己启动浏览器 | 把 `connect_cdp_url` 改为 `""` |
-| 浏览器是 Chrome / 其它内核 | 改 `browser_channel: "chrome"` 或 `executable_path` 指向对应 exe |
+| 浏览器是 Chrome / 其它内核 | 无需修改配置：调试快捷方式已复用本机 Edge/Chrome；如自行创建快捷方式，确保带 `--remote-debugging-port=9222` 参数即可 |
 
 ---
 
@@ -267,14 +304,12 @@ python main.py
 关键配置项：
 
 ```yaml
-# 浏览器沙盒（核心模块）
+# 浏览器沙盒（核心模块）：仅 CDP 接管，不自动打开浏览器
 browser_sandbox:
   enabled: true
-  browser_channel: "auto"          # auto=探测本机Edge/Chrome；msedge/chrome；""=自带Chromium
-  executable_path: ""              # 直接指定浏览器exe路径（优先级最高）
-  connect_cdp_url: "http://127.0.0.1:9222"   # 留空=自主启动浏览器；非空=CDP接管外部浏览器
+  connect_cdp_url: "http://127.0.0.1:9222"   # 接管在此调试端口启动的外部浏览器
+  monitor_browser_processes: true  # 未带调试参数的浏览器进程一律终止接管
   user_data_dir: ""                # 独立用户数据目录（不污染主浏览器）
-  default_url: "about:blank"
 
 # 浏览器内容管控规则
 browser_rules:
@@ -327,7 +362,8 @@ AOTE-ClassroomGuard/
 ├── config/
 │   └── config.yaml          # 全部可配置项
 ├── scripts/
-│   └── create_cdp_shortcut.ps1   # 创建桌面 CDP 调试浏览器快捷方式
+│   ├── create_cdp_shortcut.ps1   # 创建桌面 CDP 调试浏览器快捷方式
+│   └── hijack_browser_entries.ps1# 接管任务栏/开始菜单/URL关联，全入口带 CDP 参数（支持 -Revert）
 └── aote/                    # 核心模块包
     ├── __init__.py
     ├── config.py            # 配置加载（热重载）

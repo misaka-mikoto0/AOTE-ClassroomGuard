@@ -1,15 +1,28 @@
 """
 AOTE 管控系统 - 日志模块
-支持按日期轮转、加密存储，记录所有关键事件
+
+支持按日期轮转、保留期清理，记录所有关键事件。
+
+容错设计：日志目录/文件不可写时逐级回退（配置目录 -> %LOCALAPPDATA% ->
+项目 logs -> 系统临时目录 -> 纯控制台），保证日志模块永不阻断主程序启动。
 """
 import os
-import time
+import sys
 import logging
-import hashlib
 import threading
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import List, Optional
+
+# 日志输出格式（控制台与文件共用）
+_LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+# 轮转文件名的日期后缀（aote.log.YYYYMMDD）
+_ROTATE_SUFFIX = "%Y%m%d"
+_LOG_FILE_NAME = "aote.log"
+_LOGGER_NAME = "AOTE"
+_DEFAULT_LOG_DIR = r"C:\ProgramData\ClassroomGuard\logs"
 
 
 class _ResilientTimedRotatingFileHandler(TimedRotatingFileHandler):
@@ -31,7 +44,28 @@ class _ResilientTimedRotatingFileHandler(TimedRotatingFileHandler):
             return False
 
 
+def _program_base_dir() -> Path:
+    """程序根目录：PyInstaller 冻结时取 exe 所在目录，否则取项目根目录"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _fallback_log_dirs() -> List[Path]:
+    """主日志目录不可用时的回退候选（按优先级）"""
+    return [
+        Path(os.path.expandvars(r"%LOCALAPPDATA%\ClassroomGuard\logs")),
+        _program_base_dir() / "logs",
+    ]
+
+
+def _build_formatter() -> logging.Formatter:
+    return logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT)
+
+
 class AOTELogger:
+    """AOTE 日志门面：单例，封装标准 logging 与统一的事件日志格式"""
+
     _instance = None
     _initialized = False
     _singleton_lock = threading.Lock()
@@ -44,7 +78,8 @@ class AOTELogger:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, log_path: str = None, retention_days: int = 30):
+    def __init__(self, log_path: Optional[str] = None, retention_days: int = 30,
+                 rotate_when: str = "midnight"):
         if self._initialized:
             return
         with self._singleton_lock:
@@ -56,53 +91,48 @@ class AOTELogger:
         self._write_lock = threading.Lock()
 
         if log_path is None:
-            log_path = r"C:\ProgramData\ClassroomGuard\logs"
+            log_path = _DEFAULT_LOG_DIR
 
         self.retention_days = retention_days
-        self._fallback_reason = None
-        # 候选日志目录：按优先级尝试，第一个能成功写入 aote.log 的就用
-        project_logs = Path(__file__).resolve().parent.parent / "logs"
-        candidate_dirs = [
-            Path(log_path),
-            Path(os.path.expandvars(r"%LOCALAPPDATA%\ClassroomGuard\logs")),
-            project_logs,
-        ]
-        # 直接探测 aote.log 的可写性（不是 .write_test），避免 sandbox 拦截差异
-        # 注意：mkdir 必须在 try 内！否则目录存在但无访问权限（如 admin 创建的
-        # %LOCALAPPDATA%\ClassroomGuard 被非 admin 进程访问）时，
-        # PermissionError 会逃逸导致主程序启动即崩溃。
-        self.log_dir = None
-        for cand in candidate_dirs:
-            try:
-                cand.mkdir(parents=True, exist_ok=True)
-                log_file = cand / "aote.log"
-                # 尝试以追加模式打开实际日志文件
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.flush()
-                self.log_dir = cand
-                if cand != Path(log_path):
-                    self._fallback_reason = f"主日志目录 {log_path} 不可写，回退到 {cand}"
-                break
-            except (PermissionError, OSError):
-                continue
-        if self.log_dir is None:
-            # 终极兜底：系统临时目录（任何用户均可写），保证日志模块永不导致主程序崩溃
-            try:
-                import tempfile
-                tmp_cand = Path(tempfile.gettempdir()) / "ClassroomGuard" / "logs"
-                tmp_cand.mkdir(parents=True, exist_ok=True)
-                with open(tmp_cand / "aote.log", "a", encoding="utf-8") as f:
-                    f.flush()
-                self.log_dir = tmp_cand
-                self._fallback_reason = f"候选日志目录均不可写，回退到临时目录 {tmp_cand}"
-            except Exception:
-                self.log_dir = None
-                self._fallback_reason = "所有日志路径均不可用，仅使用控制台输出"
+        # 日志轮转时机从 time_settings.log_rotate_when 读取（如 "midnight"）
+        self._rotate_when = rotate_when or "midnight"
+        self._fallback_reason: Optional[str] = None
+        self.log_dir = self._probe_writable_dir([Path(log_path)] + _fallback_log_dirs())
         self._setup_logger()
         self._cleanup_old_logs()
 
+    # ---------- 日志目录探测 ----------
+    @staticmethod
+    def _probe_writable_dir(candidate_dirs: List[Path]) -> Optional[Path]:
+        """按优先级返回第一个可写日志文件的目录。
+        直接探测 aote.log 的可写性（不是 .write_test），避免 sandbox 拦截差异。
+        注意：mkdir 必须在 try 内！否则目录存在但无访问权限（如 admin 创建的
+        %LOCALAPPDATA%\\ClassroomGuard 被非 admin 进程访问）时，
+        PermissionError 会逃逸导致主程序启动即崩溃。
+        """
+        for cand in candidate_dirs:
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                # 尝试以追加模式打开实际日志文件
+                with open(cand / _LOG_FILE_NAME, "a", encoding="utf-8") as f:
+                    f.flush()
+                return cand
+            except (PermissionError, OSError):
+                continue
+        # 终极兜底：系统临时目录（任何用户均可写），保证日志模块永不导致主程序崩溃
+        try:
+            import tempfile
+            tmp_cand = Path(tempfile.gettempdir()) / "ClassroomGuard" / "logs"
+            tmp_cand.mkdir(parents=True, exist_ok=True)
+            with open(tmp_cand / _LOG_FILE_NAME, "a", encoding="utf-8") as f:
+                f.flush()
+            return tmp_cand
+        except Exception:
+            return None
+
+    # ---------- logger 装配 ----------
     def _setup_logger(self):
-        self.logger = logging.getLogger("AOTE")
+        self.logger = logging.getLogger(_LOGGER_NAME)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
 
@@ -110,79 +140,72 @@ class AOTELogger:
             return
 
         # 始终添加控制台输出（INFO 级），方便直接观察运行日志
-        stream_fmt = logging.Formatter(
-            "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
         stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(stream_fmt)
+        stream_handler.setFormatter(_build_formatter())
         stream_handler.setLevel(logging.INFO)
         self.logger.addHandler(stream_handler)
 
         if self.log_dir is None:
             # 所有磁盘路径均不可用：仅控制台输出，保证日志模块绝不崩溃主程序
             stream_handler.setLevel(logging.DEBUG)
-            import sys
-            print(f"[AOTELogger] {self._fallback_reason}", file=sys.stderr, flush=True)
-            self.logger.warning(self._fallback_reason)
+            self._fallback_reason = "所有日志路径均不可用，仅使用控制台输出"
+            self._report_fallback()
             return
 
-        log_file = self.log_dir / "aote.log"
-        file_handler = None
-        try:
-            file_handler = _ResilientTimedRotatingFileHandler(
-                filename=str(log_file),
-                when="midnight",
-                interval=1,
-                backupCount=self.retention_days,
-                encoding="utf-8"
-            )
-            # 创建后立即写入一条测试日志，验证 stream 真的可写
-            # （某些 sandbox 会返回无效句柄而不抛异常）
-            file_handler.emit(logging.LogRecord(
-                "AOTE", logging.INFO, __file__, 0,
-                "[AOTELogger] 文件日志初始化验证", None, None
-            ))
-        except (PermissionError, OSError) as e:
-            # 主日志文件不可写：尝试候选列表中的其他目录
-            project_logs = Path(__file__).resolve().parent.parent / "logs"
-            for cand in [Path(os.path.expandvars(r"%LOCALAPPDATA%\ClassroomGuard\logs")), project_logs]:
-                try:
-                    cand.mkdir(parents=True, exist_ok=True)
-                    log_file = cand / "aote.log"
-                    file_handler = _ResilientTimedRotatingFileHandler(
-                        filename=str(log_file),
-                        when="midnight",
-                        interval=1,
-                        backupCount=self.retention_days,
-                        encoding="utf-8"
-                    )
-                    file_handler.emit(logging.LogRecord(
-                        "AOTE", logging.INFO, __file__, 0,
-                        "[AOTELogger] 文件日志回退验证", None, None
-                    ))
-                    self.log_dir = cand
-                    self._fallback_reason = f"主日志文件不可写({e})，回退到 {cand}"
-                    break
-                except (PermissionError, OSError):
-                    file_handler = None
-                    continue
-            if file_handler is None:
-                file_handler = logging.NullHandler()
-                self._fallback_reason = f"所有日志路径均不可写，禁用文件日志 ({e})"
+        file_handler = self._build_file_handler()
         if hasattr(file_handler, "suffix"):
-            file_handler.suffix = "%Y%m%d"
-        file_fmt = logging.Formatter(
-            "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        file_handler.setFormatter(file_fmt)
+            file_handler.suffix = _ROTATE_SUFFIX
+        file_handler.setFormatter(_build_formatter())
         file_handler.setLevel(logging.DEBUG)
         self.logger.addHandler(file_handler)
         if self._fallback_reason:
-            import sys
-            print(f"[AOTELogger] {self._fallback_reason}", file=sys.stderr, flush=True)
-            self.logger.warning(self._fallback_reason)
+            self._report_fallback()
+
+    def _build_file_handler(self) -> logging.Handler:
+        """构建文件 handler：主日志不可写时回退候选目录，全部失败降级为 NullHandler"""
+        try:
+            handler: logging.Handler = self._new_rotating_handler(
+                self.log_dir / _LOG_FILE_NAME
+            )
+            self._emit_probe(handler, "文件日志初始化验证")
+            return handler
+        except (PermissionError, OSError) as e:
+            # 主日志文件不可写：尝试候选列表中的其他目录
+            for cand in _fallback_log_dirs():
+                try:
+                    cand.mkdir(parents=True, exist_ok=True)
+                    handler = self._new_rotating_handler(cand / _LOG_FILE_NAME)
+                    self._emit_probe(handler, "文件日志回退验证")
+                    self.log_dir = cand
+                    self._fallback_reason = f"主日志文件不可写({e})，回退到 {cand}"
+                    return handler
+                except (PermissionError, OSError):
+                    continue
+            self._fallback_reason = f"所有日志路径均不可写，禁用文件日志 ({e})"
+            return logging.NullHandler()
+
+    def _new_rotating_handler(self, log_file: Path) -> TimedRotatingFileHandler:
+        return _ResilientTimedRotatingFileHandler(
+            filename=str(log_file),
+            when=self._rotate_when,
+            interval=1,
+            backupCount=self.retention_days,
+            encoding="utf-8"
+        )
+
+    @staticmethod
+    def _emit_probe(handler: logging.Handler, message: str):
+        """创建后立即写入一条测试日志，验证 stream 真的可写
+        （某些 sandbox 会返回无效句柄而不抛异常）"""
+        handler.emit(logging.LogRecord(
+            _LOGGER_NAME, logging.INFO, __file__, 0,
+            f"[AOTELogger] {message}", None, None
+        ))
+
+    def _report_fallback(self):
+        """回退原因：同时写 stderr 与日志，保证连文件都不可写时仍可见"""
+        print(f"[AOTELogger] {self._fallback_reason}", file=sys.stderr, flush=True)
+        self.logger.warning(self._fallback_reason)
 
     def _cleanup_old_logs(self):
         """清理超过保留天数的日志文件"""
@@ -190,11 +213,11 @@ class AOTELogger:
             return
         try:
             cutoff = datetime.now() - timedelta(days=self.retention_days)
-            for log_file in self.log_dir.glob("aote.log.*"):
+            for log_file in self.log_dir.glob(f"{_LOG_FILE_NAME}.*"):
                 try:
                     # 从文件名提取日期
                     suffix = log_file.suffix.lstrip(".")
-                    file_date = datetime.strptime(suffix, "%Y%m%d")
+                    file_date = datetime.strptime(suffix, _ROTATE_SUFFIX)
                     if file_date < cutoff:
                         log_file.unlink()
                         self.logger.info(f"清理过期日志: {log_file.name}")
@@ -203,13 +226,10 @@ class AOTELogger:
         except Exception as e:
             print(f"清理日志失败: {e}")
 
+    # ---------- 统一事件格式 ----------
     def _log_event(self, _event_type: str, _log_level: str, _message: str, **kwargs):
         """统一的事件日志格式"""
-        extra_parts = []
-        for k, v in kwargs.items():
-            extra_parts.append(f"{k}={v}")
-        extra_str = " | ".join(extra_parts) if extra_parts else ""
-
+        extra_str = " | ".join(f"{k}={v}" for k, v in kwargs.items())
         full_msg = f"[{_event_type}] {_message}"
         if extra_str:
             full_msg += f" | {extra_str}"

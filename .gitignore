@@ -21,8 +21,15 @@ ENV/
 
 # PyInstaller
 *.spec
+# aote.spec 是手写并随源码维护的打包配置（README 中引用），需要纳入版本管理
+!aote.spec
 build/
 dist/
+# 本项目实际使用的构建输出目录（带后缀，避免误提交 60MB+ 的 exe）
+build_content/
+dist_content/
+build_*/
+dist_*/
 
 # IDE / Editor
 .vscode/
@@ -64,3 +71,13 @@ secrets.json
 # Local config overrides
 config/config.local.yaml
 config/local.yaml
+
+# 运行态文件（进程守护状态/审计/启动追踪，属于本机状态而非源码）
+guardian_state.json
+guardian_audit.log
+boot_trace.log
+crash.log
+*.tmp
+
+# IDE/助手工作目录
+.codebuddy/

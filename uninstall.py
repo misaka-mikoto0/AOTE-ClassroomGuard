@@ -11,6 +11,12 @@ import shutil
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 默认日志目录（配置未改动时使用）
+DEFAULT_LOG_DIR = r"C:\ProgramData\ClassroomGuard\logs"
+# 浏览器沙盒独立 profile 目录名（与 config.browser_sandbox.user_data_dir 默认值对应）
+PROFILE_DIR_NAMES = ("cdp_debug_profile", "chromium_profile")
+
+
 # 兼容 GBK 控制台
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -23,7 +29,7 @@ def cleanup_logs():
     """清理日志目录"""
     print("\n[1/3] 清理日志目录...")
     log_paths = [
-        r"C:\ProgramData\ClassroomGuard\logs",
+        DEFAULT_LOG_DIR,
         os.path.join(BASE_DIR, "logs"),
         os.path.join(BASE_DIR, "boot_trace.log"),
         os.path.join(BASE_DIR, "crash.log"),
@@ -51,8 +57,10 @@ def cleanup_logs():
 def cleanup_browser_profile():
     """清理浏览器沙盒用户数据目录（Playwright 独立 Chromium 数据）"""
     print("\n[2/3] 清理浏览器沙盒用户数据...")
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
     candidates = [
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "AOTE", "chromium_profile"),
+        os.path.join(local_appdata, "AOTE", name) for name in PROFILE_DIR_NAMES
+    ] + [
         os.path.join(BASE_DIR, ".playwright_profile"),
     ]
     cleaned = 0
@@ -72,8 +80,10 @@ def cleanup_pycache():
     """清理 __pycache__ 编译缓存"""
     print("\n[3/3] 清理 __pycache__ 目录...")
     cleaned = 0
-    for root, dirs, files in os.walk(BASE_DIR):
+    for root, dirs, _files in os.walk(BASE_DIR):
         if "__pycache__" in dirs:
+            # 从待遍历列表移除，避免 walk 再次进入刚删除的目录
+            dirs.remove("__pycache__")
             target = os.path.join(root, "__pycache__")
             try:
                 shutil.rmtree(target, ignore_errors=True)

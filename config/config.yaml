@@ -6,26 +6,120 @@ schedule:
   weekday:
     # 周一至周五统一课表（第1节~第12节）
     1: [["05:45", "07:10"],   # 第1节
-        ["08:05", "08:50"],   # 第2节
-        ["09:00", "09:45"],   # 第3节
-        ["10:20", "11:05"],   # 第4节
-        ["11:15", "12:00"],   # 第5节
-        ["14:30", "15:15"],   # 第6节
-        ["15:25", "16:10"],   # 第7节
-        ["16:20", "17:05"],   # 第8节
-        ["17:35", "18:20"],   # 第9节
-        ["19:00", "19:50"],   # 第10节
-        ["20:00", "20:50"],   # 第11节
-        ["21:00", "22:20"]]   # 第12节
-    2: [["05:45", "07:10"], ["08:05", "08:50"], ["09:00", "09:45"], ["10:20", "11:05"], ["11:15", "12:00"], ["14:30", "15:15"], ["15:25", "16:10"], ["16:20", "17:05"], ["17:35", "18:20"], ["19:00", "19:50"], ["20:00", "20:50"], ["21:00", "22:20"]]
-    3: [["05:45", "07:10"], ["08:05", "08:50"], ["09:00", "09:45"], ["10:20", "11:05"], ["11:15", "12:00"], ["14:30", "15:15"], ["15:25", "16:10"], ["16:20", "17:05"], ["17:35", "18:20"], ["19:00", "19:50"], ["20:00", "20:50"], ["21:00", "22:20"]]
-    4: [["05:45", "07:10"], ["08:05", "08:50"], ["09:00", "09:45"], ["10:20", "11:05"], ["11:15", "12:00"], ["14:30", "15:15"], ["15:25", "16:10"], ["16:20", "17:05"], ["17:35", "18:20"], ["19:00", "19:50"], ["20:00", "20:50"], ["21:00", "22:20"]]
-    5: [["05:45", "07:10"], ["08:05", "08:50"], ["09:00", "09:45"], ["10:20", "11:05"], ["11:15", "12:00"], ["14:30", "15:15"], ["15:25", "16:10"], ["16:20", "17:05"], ["17:35", "18:20"], ["19:00", "19:50"], ["20:00", "20:50"], ["21:00", "22:20"]]
+        ["08:05", "08:45"],   # 第2节
+        ["09:00", "09:40"],   # 第3节
+        ["10:20", "11:00"],   # 第4节
+        ["11:15", "11:55"],   # 第5节
+        ["14:30", "15:10"],   # 第6节
+        ["15:25", "16:05"],   # 第7节
+        ["16:20", "17:00"],   # 第8节
+        ["17:50", "18:30"],   # 第9节
+        ["19:10", "20:00"],   # 第10节
+        ["20:10", "21:00"],   # 第11节
+        ["21:10", "22:20"]]   # 第12节
+    2: [["05:45", "07:10"], ["08:05", "08:45"], ["09:00", "09:40"], ["10:20", "11:00"], ["11:15", "11:55"], ["14:30", "15:10"], ["15:25", "16:05"], ["16:20", "17:00"], ["17:50", "18:30"], ["19:10", "20:00"], ["20:10", "21:00"], ["21:10", "22:20"]]
+    3: [["05:45", "07:10"], ["08:05", "08:45"], ["09:00", "09:40"], ["10:20", "11:00"], ["11:15", "11:55"], ["14:30", "15:10"], ["15:25", "16:05"], ["16:20", "17:00"], ["17:50", "18:30"], ["19:10", "20:00"], ["20:10", "21:00"], ["21:10", "22:20"]]
+    4: [["05:45", "07:10"], ["08:05", "08:45"], ["09:00", "09:40"], ["10:20", "11:00"], ["11:15", "11:55"], ["14:30", "15:10"], ["15:25", "16:05"], ["16:20", "17:00"], ["17:50", "18:30"], ["19:10", "20:00"], ["20:10", "21:00"], ["21:10", "22:20"]]
+    5: [["05:45", "07:10"], ["08:05", "08:45"], ["09:00", "09:40"], ["10:20", "11:00"], ["11:15", "11:55"], ["14:30", "15:10"], ["15:25", "16:05"], ["16:20", "17:00"], ["17:50", "18:30"], ["19:10", "20:00"], ["20:10", "21:00"], ["21:10", "22:20"]]
     6: []                                          # 周六
     7: []                                          # 周日
   exceptions:
     "2026-09-10": "holiday"    # 教师节放假
     "2026-10-08": "classday"   # 调休上课
+
+# 豁免时间段（全局豁免窗口）
+# 语义：当前时间落在任一"生效窗口"内时，所有原本生效的限制规则自动暂停，
+#       不产生任何约束作用；窗口结束后的下一轮检查（time_settings.time_check_interval，
+#       默认 5 秒）内自动恢复原模式（严格/宽松仍由课表决定）。
+#
+# 起止定义（HH:MM，本地时间，左闭右开 [start, end)）：
+#   - 同天窗口：["12:00", "13:30"] = 12:00:00 ~ 13:29:59
+#   - 跨天窗口：end <= start，如 ["22:30", "06:30"] = 当天 22:30 至次日 06:30
+#   - 起止相同：["08:00", "08:00"] 按全天生效处理（沿用课表的容错语义）
+#
+# 生效范围（等同"临时解锁"，全部限制暂停）：
+#   主题限制 / 游戏关键词 / 标题正则 / 域名黑名单 / 视频管控 / 弱网限速 /
+#   域名重定向 / 未受管浏览器接管 —— 全部暂停。
+#   白名单（allowed_domains / always_allowed_domains）等"放行类"配置不受影响。
+#   与课表的关系：豁免窗口优先于课表判定；窗口内不再切换严格/宽松，
+#   窗口结束后按课表重新判定，因此不会破坏原有排课逻辑。
+#   与紧急模式的关系：紧急模式（防绕过触发）优先级最高，豁免窗口不覆盖它。
+exempt_windows:
+  enabled: true
+  # 上课时间视为"已获豁免"（默认开启）：
+  #   true  -> 上课时段 = 豁免状态，与所有限制一并暂停（含"始终生效"的主题/
+  #            游戏关键词/标题正则、视频管控、弱网、重定向、浏览器接管）
+  #   false -> 回到旧语义：上课时段仅放宽（MODE_RELAXED），"始终生效"的
+  #            topic_blocks 仍会拦截
+  # 上课/放假的判定完全来自 schedule.weekday 与 schedule.exceptions，未改动。
+  class_time_exempt: true
+  # 生效星期（ISO：1=周一 … 7=周日）；省略或留空 = 每天生效。
+  # 注意：星期/日期过滤按"判定时刻所在的那一天"计算；跨天窗口若要覆盖次日，
+  #       需把次日也写进 weekdays（例如周日 22:30-周一06:30 需含 7 和 1）。
+  weekdays: [1, 2, 3, 4, 5, 6, 7]
+  # 生效窗口列表（可多条）。默认留空 = 不启用任何豁免，功能处于待配置状态。
+  time_ranges: []
+    # - ["12:00", "13:30"]   # 午休
+    # - ["21:40", "22:00"]   # 晚自习课间
+    # - ["22:30", "06:30"]   # 跨天：睡前
+  # 日期过滤（YYYY-MM-DD）：dates 非空时，仅这些日期生效（临时性豁免用）
+  dates: []
+  # 排除日期：命中则该日整体不豁免（优先级最高，可用来临时关闭某天豁免）
+  exclude_dates: []
+
+# 进程守护与后台运行
+# 说明：本区块只使用"常规、可见、可审计"的手段——进程在任务管理器中始终可见，
+#       可查看、可结束；不使用任何隐藏进程、冻结进程或内核级技术。
+guardian:
+  enabled: true                  # 总开关：守护 + 防关停（关闭后仅保留自启）
+  # 非授权退出（被任务管理器结束、崩溃）后，由计划任务按周期自动拉起
+  restart_on_unexpected_exit: true
+  # 授权退出（托盘/热键输入管理员密码退出）后不再自动拉起，直到下次登录。
+  # 置 false 则无论何种方式退出都会被拉起。
+  respect_authorized_exit: true
+  # 守护检查周期（分钟，最小 1；Windows 计划任务的最细粒度为 1 分钟）
+  watchdog_interval_minutes: 1
+  # 静默后台：true = 不显示托盘图标（通知区域无条目）。
+  # 此时唯一管理入口是热键 Ctrl+Shift+Alt+G（仍需管理员密码）。
+  # 默认 false，保持与原来一致：托盘图标可见。
+  hide_tray_icon: false
+
+# 时间参数配置（统一从本区块读取，代码中不再硬编码时间值）
+# 涵盖：超时时间、刷新/轮询间隔、定时任务执行时间、缓存/去抖过期时间等
+time_settings:
+  # ---- 各组件轮询/检查/刷新间隔（秒）----
+  main_loop_interval: 1            # 主进程主循环休眠间隔
+  config_reload_interval: 5        # 配置热重载检查间隔
+  time_check_interval: 5           # 时间调度检查间隔
+  tray_refresh_interval: 3         # 托盘菜单状态刷新间隔
+  http_poll_interval: 1            # HTTP 服务轮询间隔
+  usb_poll_interval: 1.5           # U盘检测轮询间隔
+  usb_mount_delay: 0.5             # U盘插入后挂载稳定等待时间
+  usb_eject_restore_delay: 3.0     # 即拔即禁拔出后恢复严格模式延迟
+  # ---- 超时时间（秒）----
+  sandbox_call_timeout: 30         # 浏览器沙盒线程安全调用超时
+  sandbox_start_timeout: 60        # 浏览器沙盒启动等待超时
+  page_load_timeout_ms: 15000      # 默认页面加载超时（毫秒）
+  password_dialog_timeout: 120     # 管理员密码验证框超时
+  component_stop_timeout: 3        # 组件停止等待超时
+  tasklist_timeout: 5              # 浏览器进程查询（tasklist）超时
+  powershell_timeout: 15           # 浏览器进程命令行查询（PowerShell）超时
+  taskkill_timeout: 10             # 终止浏览器进程（taskkill）超时
+  browser_relaunch_cooldown: 10    # 自动接管重启浏览器的最小间隔（秒），防止失败时高频重试
+  # ---- 浏览器沙盒心跳/重连/监控（秒）----
+  sandbox_heartbeat_interval: 0.5  # 心跳刷新间隔
+  cdp_retry_interval: 1            # CDP 连接/重连尝试间隔
+  browser_monitor_interval: 3      # 浏览器进程监控扫描间隔
+  cdp_retry_notify_every: 10       # CDP 重试每 N 次提示一次
+  # ---- 缓存/去抖过期时间（秒）----
+  violation_cooldown: 10           # 同一 URL 违规通知去抖时间
+  # ---- 定时任务执行时间 ----
+  log_rotate_when: "midnight"      # 日志轮转时机（"midnight"=每日零点）
+  # ---- 临时解锁时长（秒）----
+  tray_unlock_5min: 300            # 托盘菜单「临时解锁 5 分钟」
+  tray_unlock_30min: 1800          # 托盘菜单「临时解锁 30 分钟」
+  unlock_options: [300, 600, 1800, 3600]   # 管理员面板解锁时长选项（秒）
+  max_custom_unlock_minutes: 180   # 管理员面板自定义解锁时长上限（分钟）
 
 # 浏览器内容管控规则（基于域名，无需操作系统进程操作）
 browser_rules:
@@ -43,7 +137,8 @@ browser_rules:
     - "7k7k.com"
     - "wanmei.com"
     - "gog.com"
-  # 白名单域名（始终放行，如学习/政务站点）
+  # 白名单域名（严格模式下优先于黑名单放行，如学习/政务站点）
+  # 注意：这里只跳过 block_domains，拦不住 topic_blocks / game_keywords。
   allowed_domains:
     - "edu.cn"
     - "gov.cn"
@@ -51,6 +146,250 @@ browser_rules:
     - "bing.com"
     - "qq.com"
     - "alipay.com"
+
+  # 全局豁免白名单（最高优先级，早于一切策略判断）：
+  # 命中域名及其全部子域名、任意路径的请求，不受任何应用层策略拦截——
+  # 包括主题限制、游戏关键词、视频管控、弱网限速、域名重定向、域名黑名单。
+  always_allowed_domains:
+    - "sjdm.my0811.cn"
+    # 微信官方根域：'weixin.com' 即覆盖 裸域 + 全部子域 + 任意路径
+    # （weixin.com、www.weixin.com、open.weixin.qq.com 这类不属于本域，见下方说明）
+    - "weixin.com"
+
+  # 域名重定向：访问命中域名时，在页面加载前直接 302 跳转到 target
+  #（请求阶段即返回，浏览器不向原站发请求、不渲染原站任何内容）。
+  # domains 支持 'mi.com' 与 '*.mi.com' 两种写法，二者均覆盖裸域 + 全部子域名
+  # + 任意路径（如 www.mi.com、order.mi.com、mall.mi.com/shop/... 一律命中）。
+  redirect_rules:
+    - name: "小米官网 -> Apple"
+      enabled: true
+      domains:
+        - "mi.com"
+        - "mi.cn"
+        - "xiaomi.com"      # 小米另一官方主域（国际站），如不需要可删此行
+        - "xiaomi.cn"
+      target: "https://www.apple.com"
+
+  # 主题内容限制：命中关键词的页面一律阻止加载并显示统一受限提示。
+  # 覆盖直接链接、站内搜索、推荐跳转、外部引荐等入口；检测维度可分别开关：
+  #   url      URL 与查询串（路由层拦截，无需等页面渲染）
+  #   title    页面标题    meta  页面元数据（keywords/description/og 等）
+  #   content  正文主题（取前 4000 字符）
+  # 命中后会向本地服务上报，记入违规日志以便审计。管理员密码 / U盘解锁时放行。
+  topic_blocks:
+    # 每条规则省略的可选项及其默认值：
+    #   check_url=true  check_title=true  check_meta=true  check_content=true
+    #   strict_mode_only=false（false=始终生效；true=仅在非上课时段生效）
+    - name: "火影忍者"
+      enabled: true
+      keywords: ["火影忍者", "火影", "naruto", "ナルト", "漩涡鸣人", "宇智波"]
+    - name: "王者荣耀"
+      enabled: true
+      keywords: ["王者荣耀", "honor of kings", "王者峡谷"]
+    - name: "英雄联盟"
+      enabled: true
+      keywords: ["英雄联盟", "英雄聯盟", "league of legends"]
+    - name: "和平精英"
+      enabled: true
+      keywords: ["和平精英", "绝地求生", "刺激战场", "pubg"]
+    - name: "原神"
+      enabled: true
+      keywords: ["原神", "genshin impact"]
+    - name: "穿越火线"
+      enabled: true
+      keywords: ["穿越火线", "crossfire"]
+    - name: "地下城与勇士"
+      enabled: true
+      keywords: ["地下城与勇士", "dungeon fighter", "dnf"]
+    - name: "我的世界"
+      enabled: true
+      keywords: ["我的世界", "minecraft"]
+    - name: "蛋仔派对"
+      enabled: true
+      keywords: ["蛋仔派对", "蛋仔"]
+    - name: "第五人格"
+      enabled: true
+      keywords: ["第五人格", "identity v"]
+    - name: "明日方舟"
+      enabled: true
+      keywords: ["明日方舟", "arknights"]
+    - name: "崩坏系列"
+      enabled: true
+      keywords: ["崩坏", "星穹铁道", "honkai"]
+    - name: "阴阳师"
+      enabled: true
+      keywords: ["阴阳师", "onmyoji"]
+    - name: "QQ飞车"
+      enabled: true
+      keywords: ["qq飞车", "qqspeed"]
+    - name: "网页小游戏"
+      enabled: true
+      keywords: ["4399小游戏", "7k7k小游戏", "小游戏大全", "h5游戏", "网页游戏"]
+
+  # 游戏关键词拦截（与 topic_blocks 并列，独立开关）：
+  #   check_url      URL / 路径 / 查询串维度（先 percent-decode，中文查询串也能命中）
+  #   check_content  页面标题 / meta 元数据 / 响应体正文前 50000 字符
+  # 匹配逻辑：中文与英文长词组按子串匹配；纯 ASCII 且 <=5 字符的短词（dnf/lol/gta/steam）
+  # 按词边界匹配（前后不能是字母或数字），避免 "cf" 命中 "config" 这类误伤。
+  game_keywords:
+    enabled: true
+    check_url: true
+    check_content: true
+    keywords:
+      # ---- 热门手游 / 端游（中文名 + 英文别名）----
+      - "王者荣耀"
+      - "honor of kings"
+      - "和平精英"
+      - "绝地求生"
+      - "刺激战场"
+      - "吃鸡"
+      - "pubg"
+      - "pubgmobile"
+      - "pubg mobile"
+      - "英雄联盟"
+      - "英雄聯盟"
+      - "league of legends"
+      - "lol"
+      - "金铲铲之战"
+      - "云顶之弈"
+      - "穿越火线"
+      - "crossfire"
+      - "地下城与勇士"
+      - "dungeon fighter"
+      - "dnf"
+      - "原神"
+      - "genshin impact"
+      - "genshin"
+      - "崩坏"
+      - "星穹铁道"
+      - "honkai"
+      - "绝区零"
+      - "鸣潮"
+      - "幻塔"
+      - "明日方舟"
+      - "arknights"
+      - "第五人格"
+      - "identity v"
+      - "阴阳师"
+      - "onmyoji"
+      - "qq飞车"
+      - "qqspeed"
+      - "梦幻西游"
+      - "大话西游"
+      - "问道手游"
+      - "天龙八部"
+      - "剑网3"
+      - "剑侠情缘"
+      - "逆水寒"
+      - "天涯明月刀"
+      - "永劫无间"
+      - "naraka"
+      - "无畏契约"
+      - "valorant"
+      - "三角洲行动"
+      - "delta force"
+      - "暗区突围"
+      - "arena breakout"
+      - "守望先锋"
+      - "overwatch"
+      - "炉石传说"
+      - "hearthstone"
+      - "魔兽世界"
+      - "world of warcraft"
+      - "反恐精英"
+      - "counter-strike"
+      - "csgo"
+      - "使命召唤"
+      - "call of duty"
+      - "侠盗猎车手"
+      - "grand theft auto"
+      - "gta"
+      - "极品飞车"
+      - "need for speed"
+      - "我的世界"
+      - "minecraft"
+      - "迷你世界"
+      - "mini world"
+      - "蛋仔派对"
+      - "蛋仔"
+      - "球球大作战"
+      - "贪吃蛇大作战"
+      - "摩尔庄园"
+      - "洛克王国"
+      - "赛尔号"
+      - "植物大战僵尸"
+      - "plants vs zombies"
+      - "pvz"
+      - "愤怒的小鸟"
+      - "angry birds"
+      - "俄罗斯方块"
+      - "tetris"
+      - "塞尔达"
+      - "zelda"
+      - "马里奥"
+      - "mario"
+      - "宝可梦"
+      - "口袋妖怪"
+      - "pokemon"
+      - "开心消消乐"
+      - "消消乐"
+      - "欢乐斗地主"
+      - "斗地主"
+      - "狼人杀"
+      # ---- 游戏平台 / 发行渠道 ----
+      - "steam"
+      - "epicgames"
+      - "epic games"
+      - "wegame"
+      - "taptap"
+      - "好游快爆"
+      - "九游"
+      - "ubisoft"
+      - "uplay"
+      - "4399"
+      - "7k7k"
+      - "miniclip"
+      - "kongregate"
+      - "crazygames"
+      - "armor games"
+      - "poki"
+      - "friv"
+      - "y8.com"
+      # ---- 通用游戏语义词（多为复合词，避免单独命中"游戏"造成误伤）----
+      - "小游戏"
+      - "网页游戏"
+      - "h5游戏"
+      - "页游"
+      - "手游"
+      - "端游"
+      - "网络游戏"
+      - "单机游戏"
+      - "免费游戏"
+      - "在线游戏"
+      - "游戏下载"
+      - "游戏大厅"
+      - "游戏专区"
+      - "游戏盒子"
+      - "云游戏"
+      - "私服"
+      - "外挂"
+      - "代练"
+      - "礼包码"
+      - "首充"
+      - "破解游戏"
+  # 页面标题正则拦截：pattern 为 Python/JS 兼容正则（统一按 IGNORECASE 匹配）。
+  # 命中时机与范围：
+  #   ① 响应体（主文档）阶段取 <title> 匹配 —— 页面渲染前即拦截，日志 reason 为
+  #      title_regex:<规则名>:<命中片段>
+  #   ② 页面内 JS 同步扫描 document.title（含异步改写标题、接管前已打开的旧标签页）
+  # 与 game_keywords 的区别：关键词表是"子串包含"，表达不了候选集合与容错写法
+  # （如 Lights\s*Off、8\s*[-\s]?ball），需要这类逻辑就用本正则通道。
+  title_regex_blocks:
+    - name: "游戏标题正则"
+      enabled: true
+      # 扫雷 / 纸牌 / 益智 / 方块 / 竞技 / 球类 / 反应测试 / 火影忍者
+      pattern: '扫雷|Minesweeper|21点|二十一点|Blackjack|2048|数图|Picross|数独|数字金字塔|金字塔纸牌|Lights\s*Off|俄罗斯方块|水果忍者|荒野乱斗|我的世界|Minecraft|灾难竞技场|谋杀|Murder|台球|桌球|8\s*[-\s]?ball|反应(?:时间|力|速度)测试|Human\s*Benchmark|火影忍者'
+
   # 自定义拦截页 HTML（留空使用内置默认页）
   blocked_page_html: ""
   # 非上课时间（严格模式）是否全面禁止视频播放：
@@ -100,42 +439,37 @@ logging:
   path: "C:\\ProgramData\\ClassroomGuard\\logs"
   retention_days: 30
 
-# 浏览器控制沙盒（Playwright）：在独立浏览器实例内直接管控浏览器内容
+# 浏览器控制沙盒（Playwright）：通过 CDP 接管外部浏览器内容管控
+# 注意：系统不再自动打开/拉起浏览器，须由用户通过带调试端口的快捷方式手动打开，
+# 沙盒连接后即接管（可配合 scripts/hijack_browser_entries.ps1 统一各入口）。
+# 接管不强制依赖独立文件目录参数（--user-data-dir）：浏览器只要带任意调试开关即
+# 判定为受管；若完全不带调试参数，则被进程监控终止并自动以受管参数重启接管。
 browser_sandbox:
-  enabled: true                # 是否随主进程自动启动
-  headless: false              # false=有头模式（可观察控制过程）；true=无头后台
-  # 本地浏览器适配（无需下载 Playwright 自带 Chromium）：
-  #   "auto"  = 自动探测本机 Edge/Chrome 并直接复用（推荐，无需下载任何浏览器）
-  #   "msedge"= 使用系统已安装的 Microsoft Edge
-  #   "chrome"= 使用系统已安装的 Google Chrome
-  #   ""      = 使用 Playwright 自带 Chromium（需先执行 python -m playwright install chromium）
-  browser_channel: "auto"
-  # 直接指定浏览器可执行文件完整路径（优先级最高，兼容任意 Chromium 内核浏览器，
-  # 如 360/QQ 极速版等），留空表示不指定。示例：
-  # executable_path: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
-  executable_path: ""
-  # CDP 连接模式（调试推荐）：非空时不再自行启动浏览器，而是接管已打开的浏览器。
-  # 留空 "" = 自主启动浏览器模式（与之前行为一致）。
+  enabled: true                # 是否随主进程自动启动（仅接管，不自动打开浏览器）
+  # CDP 连接地址：接管在此调试端口上启动的外部浏览器。
   connect_cdp_url: "http://127.0.0.1:9222"
   # ===== 全入口接管（无论通过何种方式打开浏览器，都纳入 CDP 管控）=====
   # 浏览器必须带调试端口才能被 CDP 接管，而用户从任务栏/开始菜单/热搜等入口
   # 打开的普通浏览器默认不带。AOTE 通过以下机制实现"任何入口都受管"：
   #   1) monitor_browser_processes: 持续监控系统内浏览器进程，凡不带调试参数的
   #      浏览器进程一律终止接管（最兜底的一环，请保持开启）；
-  #   2) auto_spawn_browser: CDP 连接超时后自动拉起受管浏览器（无需用户双击
-  #      专用快捷方式），配合 profile 单实例机制，后续从任意入口打开的
-  #      浏览器请求都会转发到该受管实例；
-  #   3) 可选辅助脚本 scripts/hijack_browser_entries.ps1：把桌面/开始菜单/任务栏
-  #      快捷方式及 http/https 链接关联统一改为带调试端口启动（需管理员手动执行，
-  #      支持 -Revert 还原）。
+  #   2) 可选辅助脚本 scripts/hijack_browser_entries.ps1：把桌面/开始菜单/任务栏
+  #      （状态栏）固定快捷方式及 http/https URL 关联统一改为带调试端口启动
+  #      （写入 HKCU\Software\Classes\MSEdgeHTM\shell\open\command 覆盖，无需管理员；
+  #      支持 -Revert 还原，原值备份于 %LOCALAPPDATA%\AOTE\）。
   monitor_browser_processes: true
-  auto_spawn_browser: true
-  user_data_dir: ""            # 独立用户数据目录，留空= %LOCALAPPDATA%\AOTE\chromium_profile（不污染主浏览器）
-  default_url: "about:blank"   # 启动后默认打开的页面
+  # 兜底接管（不依赖快捷方式里的 --user-data-dir 参数）：
+  # 当浏览器未带调试参数（含快捷方式参数被删、或调试参数被已运行的默认 profile
+  # 实例吞掉导致端口未开启）时，终止该实例并自动以受管参数（connect_cdp_url 对应
+  # 端口 + 独立 profile）重新拉起浏览器，保证任何入口都能被 AOTE 接管。
+  # 置 false：未受管浏览器仅被终止，不自动重启（需用户自行从带参数的入口打开）。
+  auto_relaunch_managed: true
+  # 上课时段（宽松模式）不接管浏览器进程：此时本就不拦截任何站点，
+  # 终止未受管浏览器只会打断正常教学使用；进入非上课时段（严格模式）自动恢复接管。
+  # 置 false 则恢复为"任何时段都对未受管浏览器执行终止接管"。
+  takeover_only_in_strict: true
+  user_data_dir: ""            # 独立用户数据目录，留空= %LOCALAPPDATA%\AOTE\cdp_debug_profile（不污染主浏览器）
   max_captured: 1000           # 响应捕获缓冲上限
-  # 自定义浏览器启动参数（覆盖默认值，含 --disable-web-security /
-  # --proxy-server / --remote-debugging-port；--user-data-dir 始终自动追加）
-  launch_args: []
 
 # HTTP服务配置（浏览器沙盒通信/状态上报）
 http_server:
