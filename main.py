@@ -566,8 +566,18 @@ def main():
         print("AOTE 已在运行中（单实例保护），本次启动退出。")
         return
 
-    # 登记本次运行：清除"授权退出"标记，守护重新进入保护状态
-    guardian.mark_started()
+    # 登记本次运行：清除"授权退出"标记，守护重新进入保护状态。
+    # 同时把守护策略写进状态文件，供轻量守护脚本直接读取（脚本不解析 YAML）
+    try:
+        _cfg = ConfigManager()
+        guardian.mark_started(
+            restart=bool(_cfg.get("guardian.enabled", True))
+            and bool(_cfg.get("guardian.restart_on_unexpected_exit", True)),
+            respect_authorized_exit=bool(
+                _cfg.get("guardian.respect_authorized_exit", True)),
+        )
+    except Exception:
+        guardian.mark_started()
 
     app = GuardianApp()
     app.init()

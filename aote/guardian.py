@@ -10,6 +10,23 @@ AOTE 管控系统 - 进程守护与后台运行支持
 5. 开机自启与防关停：HKCU Run 键（登录即启动）+ 每 N 分钟的守护计划任务
    （/SC ONLOGON 在非管理员上下文会被拒绝，故不用它做登录触发）
 
+守护检查为什么用"轻量脚本 + wscript"而不是再调一次本 exe：
+- 本程序是 onefile 打包（约 60MB），每次调用都要重新解压，实测从进程创建
+  到完成检查约 30~50 秒；若每分钟跑一次，等于持续占用磁盘与 CPU。
+- 轻量脚本只做"查进程 + 必要时拉起"，单次不到 1 秒，且能看到 onefile
+  引导进程刚建立的那一瞬间（不会因启动窗口期而重复拉起）。
+
+为什么宿主是 wscript 而不是 PowerShell / cmd：
+- powershell.exe 与 cmd.exe 都是**控制台子系统**程序，即使加 -WindowStyle
+  Hidden，任务计划启动时仍会先创建控制台再隐藏，导致每分钟闪一次黑窗。
+- wscript.exe 是**GUI 子系统**宿主（PE Subsystem=2），执行 VBScript 时
+  根本不会创建控制台；被拉起的本程序也是 GUI 子系统，因此全链路零窗口。
+- 脚本由本模块在安装时落盘到 <程序目录>\scripts\aote_watchdog.vbs，
+  内容刻意保持纯 ASCII（wscript 对非 BOM 文件按 ANSI 解析，含中文会乱码），
+  脚本只读不写，审计记录一律由主程序（Python，UTF-8）落笔，编码口径统一。
+- 策略（是否允许拉起、是否尊重授权退出）由主程序写进 guardian_state.json，
+  脚本只做子串判断，不解析 YAML，两者不会出现配置口径不一致。
+
 设计约束：
 - 一律不申请管理员权限（计划任务创建于当前用户，schtasks 无需提权）
 - 所有状态与审计文件都放在程序目录（部署后即 %LOCALAPPDATA%\AOTE），便于查看
@@ -40,6 +57,9 @@ RUN_VALUE = "AOTE_Guardian"
 
 STATE_FILE = "guardian_state.json"
 AUDIT_FILE = "guardian_audit.log"
+WATCHDOG_SCRIPT = "scripts/aote_watchdog.vbs"
+# 历史遗留：早期版本用的是 PowerShell 版（会闪控制台窗口），安装时顺手清理
+WATCHDOG_SCRIPT_LEGACY = "scripts/aote_watchdog.ps1"
 
 # subprocess 静默标志（避免计划任务/守护检查时闪出控制台窗口）
 _CREATE_NO_WINDOW = 0x08000000
@@ -49,6 +69,85 @@ _ERROR_ALREADY_EXISTS = 183
 
 # 两次拉起的最大间隔保护（秒）：防止计划任务/人工连续触发导致重复启动
 _SPAWN_COOLDOWN_SECONDS = 30
+
+# 轻量守护脚本（安装计划任务时落盘到 <程序目录>\scripts\aote_watchdog.vbs）
+# 单次不到 1 秒：只查进程 + 必要时拉起；由 wscript.exe（GUI 宿主）执行，零窗口。
+# 内容刻意保持纯 ASCII：wscript 对非 BOM 文件按 ANSI 解析，写中文会乱码；
+# 审计记录一律由主程序（Python，UTF-8）负责，脚本只读不写。
+WATCHDOG_VBS = r'''Option Explicit
+' AOTE lightweight process watchdog (kept ASCII-only on purpose: wscript
+' parses non-BOM script files as ANSI, so non-ASCII text would be garbled).
+' Run by Windows Task Scheduler every N minutes. No console window is ever
+' created: wscript.exe is a GUI-subsystem host (PE Subsystem=2), and the
+' application it launches is GUI-subsystem too.
+' The script only READS state and never writes files: all audit lines are
+' written by the main application, keeping one single text encoding.
+
+Dim fso, shell, scriptPath, appDir, exePath, stateFile
+Dim running, raw, lowered, ts, wmi, procs, p
+
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+
+' <App>\scripts\aote_watchdog.vbs  ->  <App>
+scriptPath = WScript.ScriptFullName
+appDir = fso.GetParentFolderName(fso.GetParentFolderName(scriptPath))
+exePath = fso.BuildPath(appDir, "AOTE.exe")
+stateFile = fso.BuildPath(appDir, "guardian_state.json")
+
+' Target missing (moved/uninstalled but the task survived): exit quietly
+If Not fso.FileExists(exePath) Then WScript.Quit 0
+
+' ---- 1) already running? match by full executable path ----
+' A full-path match avoids mistaking another copy for this one, and it sees the
+' onefile bootloader process the very moment it appears, so the startup window
+' can never cause a duplicate launch.
+running = False
+On Error Resume Next
+Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+Set procs = wmi.ExecQuery("SELECT ExecutablePath FROM Win32_Process WHERE Name='AOTE.exe'")
+If Err.Number = 0 Then
+  For Each p In procs
+    If Not IsNull(p.ExecutablePath) Then
+      If LCase(p.ExecutablePath) = LCase(exePath) Then
+        running = True
+        Exit For
+      End If
+    End If
+  Next
+Else
+  ' WMI unavailable: fall back to process-name match (prefer skipping a
+  ' restart over launching a duplicate)
+  Err.Clear
+  Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='AOTE.exe'")
+  If Err.Number = 0 Then
+    If procs.Count > 0 Then running = True
+  End If
+End If
+Err.Clear
+On Error GoTo 0
+
+If running Then WScript.Quit 0
+
+' ---- 2) policy from guardian_state.json (substring test; spaces stripped) ----
+If fso.FileExists(stateFile) Then
+  On Error Resume Next
+  Set ts = fso.OpenTextFile(stateFile, 1)
+  raw = ts.ReadAll
+  ts.Close
+  Err.Clear
+  On Error GoTo 0
+  lowered = LCase(Replace(raw, " ", ""))
+  ' Authorized exit (admin password / hotkey): never auto restart
+  If InStr(lowered, """authorized_exit"":true") > 0 Then WScript.Quit 0
+  ' Restart disabled by configuration
+  If InStr(lowered, """restart_on_unexpected_exit"":false") > 0 Then WScript.Quit 0
+End If
+
+' ---- 3) start the application hidden and do not wait ----
+shell.Run """" & exePath & """", 0, False
+WScript.Quit 0
+'''
 
 
 def base_dir() -> Path:
@@ -132,14 +231,29 @@ def is_running() -> bool:
 # ======================================================
 # 授权退出标记（主程序调用）
 # ======================================================
-def mark_started() -> None:
-    """主程序启动完成：清除授权退出标记，登记本次运行。"""
+def mark_started(restart: bool = True, respect_authorized_exit: bool = True) -> None:
+    """主程序启动完成：清除授权退出标记，登记本次运行。
+
+    同时把守护策略写进状态文件：轻量守护脚本据此判断"要不要拉起"，
+    避免脚本再去解析 config.yaml（口径只有一处，不会不一致）。
+
+    另外这里顺带做"异常终止"审计：上一次状态若是"运行中"且未标记授权退出，
+    说明进程是被强杀或崩溃掉的——这条记录由主程序自己落笔（UTF-8），
+    守护脚本只读不写，因此审计日志的编码口径始终统一。
+    """
+    prev = read_state()
+    abnormal = bool(prev.get("running")) and not bool(prev.get("authorized_exit"))
+    if abnormal:
+        audit("检测到上次运行被非授权终止（或崩溃），已由守护自动拉起")
     write_state(
         running=True,
         pid=os.getpid(),
         started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         authorized_exit=False,
         exit_reason="",
+        # 键名与 config 中 guardian.* 保持一致，便于对照排查
+        restart_on_unexpected_exit=bool(restart),
+        respect_authorized_exit=bool(respect_authorized_exit),
     )
     audit(f"主进程启动 PID={os.getpid()}")
 
@@ -245,14 +359,99 @@ def _run_schtasks(args: list, timeout: float = 15.0) -> Tuple[int, str]:
         return -1, str(e)
 
 
+def ensure_watchdog_script() -> str:
+    """把轻量守护脚本落盘（内容有变化才重写），返回脚本路径；失败返回空串。
+
+    由程序自己生成而不是依赖打包附带：即使只拷贝了 exe，也能拿到轻量守护路径，
+    不会悄悄退化成"每分钟重新解压一次 60MB exe"的重方案。
+    """
+    try:
+        path = base_dir() / WATCHDOG_SCRIPT
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 纯 ASCII 写盘：wscript 对非 BOM 的 .vbs 按 ANSI 解析，
+        # 一旦混入中文就会乱码（encode("ascii") 失败即视为配置错误，
+        # 此时返回空串由调用方回退到 exe 自检，保证不会静默失效）。
+        expected = WATCHDOG_VBS.encode("ascii")
+        need_write = True
+        if path.exists():
+            try:
+                need_write = path.read_bytes() != expected
+            except Exception:
+                need_write = True
+        if need_write:
+            path.write_bytes(expected)
+        # 清理早期 PowerShell 版本（会闪控制台窗口，避免残留被误用）
+        legacy = base_dir() / WATCHDOG_SCRIPT_LEGACY
+        if legacy.exists():
+            try:
+                legacy.unlink()
+            except Exception:
+                pass
+        return str(path)
+    except Exception as e:
+        audit(f"守护脚本落盘失败: {e}")
+        return ""
+
+
+def _wscript_path() -> str:
+    """wscript.exe 的绝对路径（GUI 宿主，执行脚本时不创建控制台）。
+
+    取不到时返回空串，由调用方回退到 exe 自检——绝不回退到 powershell/cmd，
+    那两个是控制台程序，会闪黑窗，正是本次要消除的问题。
+    """
+    try:
+        root = os.environ.get("SystemRoot") or r"C:\Windows"
+        for rel in ("System32", "SysWOW64"):
+            candidate = Path(root) / rel / "wscript.exe"
+            if candidate.exists():
+                return str(candidate)
+    except Exception:
+        pass
+    return ""
+
+
+def _exe_path() -> str:
+    """主程序可执行文件路径（冻结=exe 本身；源码运行=pythonw），供守护脚本比对进程。"""
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve())
+    return _launch_command()[0]
+
+
+def _watchdog_command() -> str:
+    """守护计划任务 /TR 命令行：wscript 跑轻量 VBS；不可用时回退 exe 自检。
+
+    - wscript.exe 是 GUI 子系统宿主，全程不创建控制台，因此每分钟执行
+      也不会有任何窗口闪现（powershell.exe / cmd.exe 做不到这一点）。
+    - 命令很短（约 110 字符），远低于 schtasks 对 /TR 的 261 字符上限；
+      脚本目录由脚本自身按 WScript.ScriptFullName 推导，无需传参。
+    """
+    script = ensure_watchdog_script()
+    wscript = _wscript_path()
+    if script and wscript:
+        cmd = f'"{wscript}" //B //Nologo "{script}"'
+        if len(cmd) <= 261:
+            return cmd
+    return _launch_command_str("--ensure-running")
+
+
 def install_tasks(interval_minutes: int = 1) -> Tuple[bool, str]:
-    """注册周期守护计划任务（当前用户、无需提权）。返回 (是否成功, 说明)。"""
+    """注册周期守护计划任务（当前用户、无需提权）。返回 (是否成功, 说明)。
+
+    任务执行的是轻量守护脚本（单次约 1 秒），而不是重新调用本 exe——
+    后者会因 onefile 解压产生 30~50 秒/次的开销。
+    """
     interval = max(int(interval_minutes), 1)
-    watch_cmd = _launch_command_str("--ensure-running")
+    if not getattr(sys, "frozen", False):
+        # 守护任务只在打包运行（AOTE.exe）时注册：源码模式下进程是 pythonw，
+        # 既无法按 exe 全路径精确匹配（会误判其他 python 进程），
+        # 也不适合作为交付形态。源码模式请直接运行程序。
+        return False, "源码运行模式不注册守护任务，请用打包后的 AOTE.exe 安装"
+    watch_cmd = _watchdog_command()
     rc, out = _run_schtasks(["/Create", "/TN", TASK_WATCHDOG, "/SC", "MINUTE",
                              "/MO", str(interval), "/TR", watch_cmd, "/F"])
     if rc == 0:
-        return True, f"守护任务已注册（每 {interval} 分钟检查一次）"
+        mode = "轻量守护脚本" if WATCHDOG_SCRIPT.split("/")[-1] in watch_cmd else "exe 自检（回退）"
+        return True, f"守护任务已注册（{mode}，每 {interval} 分钟检查一次）"
     return False, f"watchdog=(rc={rc}) {out}"
 
 

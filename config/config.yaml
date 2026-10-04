@@ -78,6 +78,11 @@ guardian:
   # 置 false 则无论何种方式退出都会被拉起。
   respect_authorized_exit: true
   # 守护检查周期（分钟，最小 1；Windows 计划任务的最细粒度为 1 分钟）
+  # 检查由 wscript.exe 执行轻量 VBScript（只查进程 + 必要时拉起，单次不到 1 秒），
+  # 不会重复调用本 exe，因此 1 分钟间隔的开销可忽略。
+  # 【无窗口保证】wscript.exe 与被拉起的程序都是 GUI 子系统，执行期间不会创建
+  # 控制台；刻意不使用 powershell/cmd（控制台程序，即使隐藏也会闪一下黑窗）。
+  # 脚本由程序在安装自启时落盘到 <程序目录>\scripts\aote_watchdog.vbs。
   watchdog_interval_minutes: 1
   # 静默后台：true = 不显示托盘图标（通知区域无条目）。
   # 此时唯一管理入口是热键 Ctrl+Shift+Alt+G（仍需管理员密码）。
@@ -389,6 +394,15 @@ browser_rules:
       enabled: true
       # 扫雷 / 纸牌 / 益智 / 方块 / 竞技 / 球类 / 反应测试 / 火影忍者
       pattern: '扫雷|Minesweeper|21点|二十一点|Blackjack|2048|数图|Picross|数独|数字金字塔|金字塔纸牌|Lights\s*Off|俄罗斯方块|水果忍者|荒野乱斗|我的世界|Minecraft|灾难竞技场|谋杀|Murder|台球|桌球|8\s*[-\s]?ball|反应(?:时间|力|速度)测试|Human\s*Benchmark|火影忍者'
+    # 标题含"游戏"即拦截：任何页面的 <title> 里出现"游戏"两字一律阻断
+    # （覆盖"小游戏""游戏下载""网页游戏""4399游戏"等全部变体）。
+    # 命中记录为 title_regex:标题含游戏:游戏
+    # 注意：这是子串匹配，标题里出现"游戏"就拦——包括"游戏引擎""游戏化学习"
+    # 这类非娱乐内容。如需收紧，把 pattern 换成更具体的词，例如
+    #   pattern: '游戏下载|小游戏|网页游戏|在线游戏|游戏专区'
+    - name: "标题含游戏"
+      enabled: true
+      pattern: '游戏'
 
   # 自定义拦截页 HTML（留空使用内置默认页）
   blocked_page_html: ""

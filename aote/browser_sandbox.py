@@ -41,6 +41,8 @@ from urllib.parse import urlparse, unquote
 from html import unescape as html_unescape
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from .block_page import DEFAULT_BLOCKED_PAGE, BLOCK_PAGE_FRAGMENT
+
 
 # 管控模式常量
 MODE_RELAXED = "relaxed"        # 宽松：全部放行（上课/授权时段）
@@ -201,32 +203,13 @@ class _NetworkSniffer:
 
 
 # ======================================================
-# 默认管控拦截页（可被 config browser_rules.*_page_html 覆盖）
+# 默认管控拦截页
 # ======================================================
-DEFAULT_BLOCKED_PAGE = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<title>网站已被管控</title>
-<style>
- body{margin:0;font-family:"Microsoft YaHei",Arial,sans-serif;
-      background:linear-gradient(135deg,#1e3c72,#2a5298);color:#fff;
-      display:flex;align-items:center;justify-content:center;min-height:100vh}
- .card{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);
-      border-radius:16px;padding:48px 56px;max-width:560px;text-align:center;
-      box-shadow:0 12px 40px rgba(0,0,0,.35)}
- .icon{font-size:64px;margin-bottom:16px}
- h1{font-size:28px;margin:0 0 12px}
- p{font-size:16px;line-height:1.7;opacity:.9;margin:0}
- .tag{display:inline-block;margin-top:20px;padding:6px 18px;border-radius:999px;
-      background:rgba(255,255,255,.15);font-size:13px}
-</style></head><body>
-<div class="card">
-  <div class="icon">🚫</div>
-  <h1>该网站已被管控</h1>
-  <p>当前处于受管控时间，娱乐/游戏类内容已暂停访问。<br>
-     请专注于学习内容。</p>
-  <span class="tag">AOTE 浏览器内容管控</span>
-</div>
-</body></html>"""
+# 页面样式与结构统一维护在 aote/block_page.py（表现层独立，便于单独调样式）：
+#   DEFAULT_BLOCKED_PAGE —— 路由层 403 响应使用的完整文档
+#   BLOCK_PAGE_FRAGMENT  —— 页面内 JS 注入使用的 head+body 片段
+# 两者共用同一套 CSS，避免"路由页 / JS 注入页"样式各自漂移。
+# 可被 config browser_rules.blocked_page_html 整体覆盖（自定义页面原样返回）。
 
 
 # ======================================================
@@ -388,21 +371,21 @@ TOPIC_BLOCK_JS = """\
   function blocked(name, kw) {
     done = true;
     try { window.stop(); } catch (e) {}
-    var html =
-      '<head><meta charset="utf-8"><title>访问受限</title></head>' +
-      '<body style="margin:0;font-family:Microsoft YaHei,Arial,sans-serif;' +
-      'background:linear-gradient(135deg,#1e3c72,#2a5298);color:#fff;display:flex;' +
-      'align-items:center;justify-content:center;min-height:100vh">' +
-      '<div style="background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);' +
-      'border-radius:16px;padding:48px 56px;max-width:560px;text-align:center">' +
-      '<div style="font-size:64px;margin-bottom:16px">&#128683;</div>' +
-      '<h1 style="font-size:28px;margin:0 0 12px">访问受限</h1>' +
-      '<p style="font-size:16px;line-height:1.7;opacity:.9;margin:0">' +
-      '当前页面命中内容管控规则，已阻止加载。</p>' +
-      '<span style="display:inline-block;margin-top:20px;padding:6px 18px;' +
-      'border-radius:999px;background:rgba(255,255,255,.15);font-size:13px">' +
-      'AOTE 内容管控</span></div></body>';
+    // 拦截页 HTML 由主程序注入（与路由层 403 页共用 aote/block_page.py 的同一套模板，
+    // 保证两处观感一致）。内联 onclick 依赖 document 内联脚本执行，天然可用。
+    var html = __BLOCK_HTML__;
     try { document.documentElement.innerHTML = html; } catch (e) {}
+    // 移动端适配：原站可能没写 viewport，或写死了窄于设备的宽度，
+    // 这里强制按设备宽度渲染，否则手机上拦截页会整体缩放走样。
+    try {
+      var vp = document.querySelector('meta[name="viewport"]');
+      if (!vp) {
+        vp = document.createElement('meta');
+        vp.setAttribute('name', 'viewport');
+        (document.head || document.documentElement).appendChild(vp);
+      }
+      vp.setAttribute('content', 'width=device-width,initial-scale=1,viewport-fit=cover');
+    } catch (e) {}
     // 上报审计：本地服务会把该 URL 记入违规日志并加入即时拦截清单
     try {
       fetch(REPORT, { method: 'POST', mode: 'no-cors',
@@ -901,6 +884,8 @@ class BrowserSandbox:
                                      for n, p, _ in self._title_regex_rules],
                                     ensure_ascii=False))
                 .replace("__EXEMPT__", "true" if self.is_exempt() else "false")
+                .replace("__BLOCK_HTML__",
+                         json.dumps(BLOCK_PAGE_FRAGMENT, ensure_ascii=False))
                 .replace("__REPORT_URL__", f"http://127.0.0.1:{port}/kill"))
 
     # ============ 违规回调 ============
